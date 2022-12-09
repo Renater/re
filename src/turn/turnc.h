@@ -26,6 +26,7 @@ struct turnc {
 	int proto;                     /**< Transport protocol              */
 	struct stun *stun;             /**< STUN Instance                   */
 	uint32_t lifetime;             /**< Allocation lifetime in [seconds]*/
+	uint64_t *token;
 	struct tmr tmr;                /**< Allocation refresh timer        */
 	turnc_h *th;                   /**< Turn client handler             */
 	void *arg;                     /**< Handler argument                */
