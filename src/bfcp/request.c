@@ -170,12 +170,14 @@ int bfcp_vrequest(struct bfcp_conn *bc, const struct sa *dst, uint8_t ver,
 		goto out;
 	}
 
+	ct->mb->pos = ct->mb->end = 4;
+
 	err = bfcp_msg_vencode(ct->mb, ver, false, prim, confid, ct->tid,
 			       userid, attrc, ap);
 	if (err)
 		goto out;
 
-	ct->mb->pos = 0;
+	ct->mb->pos = 4;
 
 	if (!bc->ctransl.head) {
 
