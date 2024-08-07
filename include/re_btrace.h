@@ -1,8 +1,8 @@
 /**
- * @file re_btrace.h  Backtrace API (Linux/Unix only)
+ * @file re_btrace.h  Backtrace API
  *
  */
-#define BTRACE_SZ 10
+#define BTRACE_SZ 16
 
 struct btrace {
 	void *stack[BTRACE_SZ];
@@ -21,6 +21,20 @@ static inline int btrace(struct btrace *bt)
 		return EINVAL;
 
 	bt->len = backtrace(bt->stack, BTRACE_SZ);
+
+	return 0;
+}
+#elif defined(WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+static inline int btrace(struct btrace *bt)
+{
+	if (!bt)
+		return EINVAL;
+
+	bt->len = CaptureStackBackTrace(0, BTRACE_SZ, bt->stack, NULL);
 
 	return 0;
 }

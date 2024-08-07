@@ -4,12 +4,8 @@
  * Copyright (C) 2010 Creytiv.com
  * Copyright (C) 2022 Sebastian Reimers
  */
-#define _BSD_SOURCE 1
-#define _DEFAULT_SOURCE 1
-
 #ifndef WIN32
 #include <arpa/inet.h>
-#define __USE_POSIX 1  /**< Use POSIX flag */
 #include <netdb.h>
 #endif
 
@@ -36,7 +32,7 @@
 
 
 enum {
-	NTX_MAX = 20,
+	NTX_MAX = 4,
 	QUERY_HASH_SIZE = 16,
 	TCP_HASH_SIZE = 2,
 	CONN_TIMEOUT = 10 * 1000,
@@ -44,7 +40,8 @@ enum {
 	SRVC_MAX = 32,
 	RR_MAX = 32,
 	CACHE_TTL_MAX = 1800,
-	GETADDRINFO_TTL = 60
+	GETADDRINFO_TTL = 60,
+	RRLV_MAX = 3
 };
 
 
@@ -69,7 +66,7 @@ struct dns_query {
 	struct tmr tmr;
 	struct tmr tmr_ttl;
 	struct mbuf mb;
-	struct list rrlv[3];
+	struct list *rrlv[RRLV_MAX];
 	char *name;
 	const struct sa *srvv;
 	const uint32_t *srvc;
@@ -91,7 +88,9 @@ struct dnsquery {
 	char *name;
 	uint16_t type;
 	uint16_t dnsclass;
+	struct list *rrlv;
 	bool cache;
+	struct dnsc *dnsc; /* parent */
 };
 
 
@@ -152,7 +151,6 @@ static void query_abort(struct dns_query *q)
 static void query_destructor(void *data)
 {
 	struct dns_query *q = data;
-	uint32_t i;
 
 	query_abort(q);
 	tmr_cancel(&q->tmr_ttl);
@@ -160,8 +158,10 @@ static void query_destructor(void *data)
 	mem_deref(q->name);
 	list_unlink(&q->le_hdl);
 
-	for (i=0; i<ARRAY_SIZE(q->rrlv); i++)
-		(void)list_apply(&q->rrlv[i], true, rr_unlink_handler, NULL);
+	for (int i = 0; i < RRLV_MAX; i++) {
+		(void)list_apply(q->rrlv[i], true, rr_unlink_handler, NULL);
+		mem_deref(q->rrlv[i]);
+	}
 }
 
 
@@ -284,7 +284,7 @@ static int reply_recv(struct dnsc *dnsc, struct mbuf *mb)
 	nv[2] = dq.hdr.nadd;
 
 	DEBUG_INFO("--- ANSWER SECTION id: %d ---\n", q->id);
-	for (uint32_t i = 0; i < ARRAY_SIZE(nv); i++) {
+	for (uint32_t i = 0; i < RE_ARRAY_SIZE(nv); i++) {
 		uint32_t l = nv[i];
 
 		if (l > RR_MAX) {
@@ -305,7 +305,7 @@ static int reply_recv(struct dnsc *dnsc, struct mbuf *mb)
 
 			DEBUG_INFO("%H\n", dns_rr_print, rr);
 
-			list_append(&q->rrlv[i], &rr->le_priv, rr);
+			list_append(q->rrlv[i], &rr->le_priv, rr);
 			if (rr->ttl < ttl)
 				ttl = rr->ttl;
 		}
@@ -315,8 +315,8 @@ static int reply_recv(struct dnsc *dnsc, struct mbuf *mb)
 
 		struct dnsrr *rrh, *rrt;
 
-		rrh = list_ledata(list_head(&q->rrlv[0]));
-		rrt = list_ledata(list_tail(&q->rrlv[0]));
+		rrh = list_ledata(list_head(q->rrlv[0]));
+		rrt = list_ledata(list_tail(q->rrlv[0]));
 
 		/* Wait for last AXFR reply with terminating SOA record */
 		if (dq.hdr.rcode == DNS_RCODE_OK && dq.hdr.nans > 0 &&
@@ -327,7 +327,7 @@ static int reply_recv(struct dnsc *dnsc, struct mbuf *mb)
 	}
 
 	q->hdr = dq.hdr;
-	query_handler(q, 0, &q->rrlv[0], &q->rrlv[1], &q->rrlv[2]);
+	query_handler(q, 0, q->rrlv[0], q->rrlv[1], q->rrlv[2]);
 
 
 	if (!dnsc->conf.cache_ttl_max || q->type == DNS_QTYPE_AXFR) {
@@ -343,7 +343,7 @@ static int reply_recv(struct dnsc *dnsc, struct mbuf *mb)
 
 	/* Cache negative answer with SOA minimum value (RFC 2308) */
 	if (!dq.hdr.nans && dq.hdr.nauth) {
-		const struct dnsrr *rr = list_ledata(list_head(&q->rrlv[1]));
+		const struct dnsrr *rr = list_ledata(list_head(q->rrlv[1]));
 
 		if (!rr || rr->type != DNS_TYPE_SOA) {
 			mem_deref(q);
@@ -698,15 +698,17 @@ static void udp_timeout_handler(void *arg)
 	struct dns_query *q = arg;
 	int err = ETIMEDOUT;
 
-	if (q->ntx >= NTX_MAX)
+	if (q->ntx >= NTX_MAX * *q->srvc)
 		goto out;
 
 	err = send_udp(q);
 	if (err)
 		goto out;
 
-	tmr_start(&q->tmr, 1000<<MIN(2, q->ntx - 2),
-		  udp_timeout_handler, q);
+	int timeout = 500 << MIN(2, (q->ntx - 1) / *q->srvc);
+
+	DEBUG_INFO("waiting udp timeout: %dms\n", timeout);
+	tmr_start(&q->tmr, timeout, udp_timeout_handler, q);
 
  out:
 	if (err) {
@@ -727,12 +729,12 @@ static void hdl_tmr_cache(void *arg)
 		struct le *re_rr;
 		DEBUG_INFO("--- ANSWER SECTION (CACHED) id: %d ---\n",
 			   q->id);
-		LIST_FOREACH(&q->rrlv[0], re_rr) {
+		LIST_FOREACH(q->rrlv[0], re_rr) {
 			struct dnsrr *rr = re_rr->data;
 			DEBUG_INFO("%H\n", dns_rr_print, rr);
 		}
 #endif
-		query_handler(q, 0, &q->rrlv[0], &q->rrlv[1], &q->rrlv[2]);
+		query_handler(q, 0, q->rrlv[0], q->rrlv[1], q->rrlv[2]);
 	}
 	list_flush(l);
 }
@@ -757,17 +759,14 @@ static bool query_cache_handler(struct dns_query *q)
 		return false;
 
 
-	for (uint32_t i = 0; i < ARRAY_SIZE(qc->rrlv); i++) {
-		LIST_FOREACH(&qc->rrlv[i], le)
+	for (int i = 0; i < RRLV_MAX; i++) {
+		LIST_FOREACH(qc->rrlv[i], le)
 		{
 			struct dnsrr *rr = le->data;
 			mem_ref(rr);
 		}
+		q->rrlv[i] = mem_ref(qc->rrlv[i]);
 	}
-
-	q->rrlv[0] = qc->rrlv[0];
-	q->rrlv[1] = qc->rrlv[1];
-	q->rrlv[2] = qc->rrlv[2];
 
 	hash_unlink(&q->le);
 	list_append(&q->dnsc->hdl_cache, &q->le_hdl, q);
@@ -799,7 +798,7 @@ static bool getaddr_dup(struct le *le, void *arg)
 
 static int async_getaddrinfo(void *arg)
 {
-	struct dns_query *q = arg;
+	struct dnsquery *dq = arg;
 	int err;
 	struct addrinfo *res0 = NULL;
 	struct addrinfo *res;
@@ -808,13 +807,13 @@ static int async_getaddrinfo(void *arg)
 
 	memset(&hints, 0, sizeof(hints));
 
-	if (q->type == DNS_TYPE_A)
+	if (dq->type == DNS_TYPE_A)
 		hints.ai_family = AF_INET;
-	if (q->type == DNS_TYPE_AAAA)
+	if (dq->type == DNS_TYPE_AAAA)
 		hints.ai_family = AF_INET6;
 	hints.ai_flags = AI_ADDRCONFIG;
 
-	err = getaddrinfo(q->name, NULL, &hints, &res0);
+	err = getaddrinfo(dq->name, NULL, &hints, &res0);
 	if (err)
 		return EADDRNOTAVAIL;
 
@@ -827,7 +826,7 @@ static int async_getaddrinfo(void *arg)
 			goto out;
 		}
 
-		str_dup(&rr->name, q->name);
+		str_dup(&rr->name, dq->name);
 
 		rr->dnsclass = DNS_CLASS_IN;
 		rr->ttl	     = GETADDRINFO_TTL;
@@ -850,18 +849,18 @@ static int async_getaddrinfo(void *arg)
 			sa_in6(&sa, rr->rdata.aaaa.addr);
 		}
 
-		le = list_apply(&q->rrlv[0], false, getaddr_dup, rr);
+		le = list_apply(dq->rrlv, false, getaddr_dup, rr);
 		if (le) {
 			mem_deref(rr);
 			continue;
 		}
 
-		list_append(&q->rrlv[0], &rr->le_priv, rr);
+		list_append(dq->rrlv, &rr->le_priv, rr);
 	}
 
 out:
 	if (err)
-		list_flush(&q->rrlv[0]);
+		list_flush(dq->rrlv);
 
 	freeaddrinfo(res0);
 
@@ -871,30 +870,60 @@ out:
 
 static void getaddrinfo_h(int err, void *arg)
 {
-	struct dns_query *q = arg;
+	struct dnsquery *dq = arg;
+	struct dns_query *q;
+
+	q = list_ledata(hash_lookup(dq->dnsc->ht_query,
+				    hash_joaat_str_ci(dq->name),
+				    query_cmp_handler, dq));
+	if (!q) {
+		DEBUG_WARNING("getaddrinfo_h: no query found\n");
+		list_flush(dq->rrlv);
+		mem_deref(dq->rrlv);
+		goto out;
+	}
+
+	mem_deref(q->rrlv[0]);
+	q->rrlv[0] = dq->rrlv;
+
 	const bool cache = q->dnsc->conf.cache_ttl_max > 0;
 
 	DEBUG_INFO("--- ANSWER SECTION (getaddrinfo) id: %d %s ---\n", q->id,
 		   cache ? "(caching)" : "");
 
-	if (!err) {
+	if (err) {
+		DEBUG_INFO("getaddrinfo_h: err %m\n", err);
+	}
+	else {
 		struct le *le;
-		LIST_FOREACH(&q->rrlv[0], le)
+		LIST_FOREACH(q->rrlv[0], le)
 		{
 			DEBUG_INFO("%H%s\n", dns_rr_print, le->data);
 		}
 	}
 
-	query_handler(q, err, &q->rrlv[0], &q->rrlv[1], &q->rrlv[2]);
+	query_handler(q, err, q->rrlv[0], q->rrlv[1], q->rrlv[2]);
 
 	if (err || !cache) {
 		mem_deref(q);
-		return;
+		goto out;
 	}
 
 	hash_append(q->dnsc->ht_query_cache, hash_joaat_str_ci(q->name),
 		    &q->le, q);
 	tmr_start(&q->tmr_ttl, GETADDRINFO_TTL * 1000, ttl_timeout_handler, q);
+
+out:
+	mem_deref(dq);
+}
+
+
+static void dq_deref(void *arg)
+{
+	struct dnsquery *dq = arg;
+
+	mem_deref(dq->dnsc);
+	mem_deref(dq->name);
 }
 
 
@@ -902,9 +931,35 @@ static int query_getaddrinfo(struct dns_query *q)
 {
 	int err;
 
-	err = re_thread_async(async_getaddrinfo, getaddrinfo_h, q);
+	struct dnsquery *dq = mem_zalloc(sizeof(struct dnsquery), dq_deref);
+	if (!dq)
+		return ENOMEM;
+
+	err = str_dup(&dq->name, q->name);
+	if (err)
+		goto out;
+
+	dq->type       = q->type;
+	dq->hdr.id     = q->id;
+	dq->hdr.opcode = q->opcode;
+	dq->dnsclass   = q->dnsclass;
+	dq->dnsc       = mem_ref(q->dnsc);
+
+	dq->rrlv = mem_alloc(sizeof(struct list), NULL);
+	if (!dq->rrlv) {
+		err = ENOMEM;
+		goto out;
+	}
+
+	list_init(dq->rrlv);
+
+	err = re_thread_async(async_getaddrinfo, getaddrinfo_h, dq);
 	if (err)
 		DEBUG_WARNING("re_thread_async: %m\n", err);
+
+out:
+	if (err)
+		mem_deref(dq);
 
 	return err;
 }
@@ -919,7 +974,6 @@ static int query(struct dns_query **qp, struct dnsc *dnsc, uint8_t opcode,
 	struct dns_query *q = NULL;
 	struct dnshdr hdr;
 	int err = 0;
-	uint32_t i;
 
 	if (!dnsc || !name || !srvv || !srvc || !(*srvc))
 		return EINVAL;
@@ -935,9 +989,6 @@ static int query(struct dns_query **qp, struct dnsc *dnsc, uint8_t opcode,
 	tmr_init(&q->tmr);
 	tmr_init(&q->tmr_ttl);
 	mbuf_init(&q->mb);
-
-	for (i=0; i<ARRAY_SIZE(q->rrlv); i++)
-		list_init(&q->rrlv[i]);
 
 	err = str_dup(&q->name, name);
 	if (err)
@@ -970,6 +1021,13 @@ static int query(struct dns_query **qp, struct dnsc *dnsc, uint8_t opcode,
 
 	if (query_cache_handler(q))
 		goto out;
+
+	for (int i = 0; i < RRLV_MAX; i++) {
+		q->rrlv[i] = mem_alloc(sizeof(struct list), NULL);
+		if (!q->rrlv[i])
+			goto nmerr;
+		list_init(q->rrlv[i]);
+	}
 
 	if (dnsc->conf.getaddrinfo &&
 	    (q->type == DNS_TYPE_A || q->type == DNS_TYPE_AAAA)) {
@@ -1159,9 +1217,7 @@ int dnsc_alloc(struct dnsc **dcpp, const struct dnsc_conf *conf,
 {
 	struct dnsc *dnsc;
 	struct sa laddr;
-#ifdef HAVE_INET6
 	struct sa laddr6;
-#endif
 	int err;
 
 	if (!dcpp)
@@ -1183,10 +1239,9 @@ int dnsc_alloc(struct dnsc **dcpp, const struct dnsc_conf *conf,
 	sa_set_str(&laddr, "0.0.0.0", 0);
 	err  = udp_listen(&dnsc->us, &laddr, udp_recv_handler, dnsc);
 
-#ifdef HAVE_INET6
 	sa_set_str(&laddr6, "::", 0);
 	err &= udp_listen(&dnsc->us6, &laddr6, udp_recv_handler, dnsc);
-#endif
+
 	if (err)
 		goto out;
 
@@ -1274,7 +1329,7 @@ int dnsc_srv_set(struct dnsc *dnsc, const struct sa *srvv, uint32_t srvc)
 	if (!dnsc)
 		return EINVAL;
 
-	dnsc->srvc = min((uint32_t)ARRAY_SIZE(dnsc->srvv), srvc);
+	dnsc->srvc = min((uint32_t)RE_ARRAY_SIZE(dnsc->srvv), srvc);
 
 	if (srvv) {
 		for (i=0; i<dnsc->srvc; i++)

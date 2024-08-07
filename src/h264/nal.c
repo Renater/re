@@ -155,7 +155,8 @@ int h264_fu_hdr_decode(struct h264_fu *fu, struct mbuf *mb)
  *
  * @note: copied from ffmpeg source
  */
-const uint8_t *h264_find_startcode(const uint8_t *p, const uint8_t *end)
+static const uint8_t *h264_find_startcode_int(const uint8_t *p,
+					      const uint8_t *end)
 {
 	const uint8_t *a = p + 4 - ((size_t)p & 3);
 
@@ -188,6 +189,18 @@ const uint8_t *h264_find_startcode(const uint8_t *p, const uint8_t *end)
 	}
 
 	return end + 3;
+}
+
+
+const uint8_t *h264_find_startcode(const uint8_t *p, const uint8_t *end)
+{
+	const uint8_t *out = h264_find_startcode_int(p, end);
+
+	/* check for 4-byte startcode */
+	if (p<out && out<end && !out[-1])
+		--out;
+
+	return out;
 }
 
 
@@ -352,17 +365,8 @@ int h264_stap_encode(struct mbuf *mb, const uint8_t *frame,
 }
 
 
-/**
- * Decode STAP-A payload and convert to Annex-B NAL units
- *
- * @param mb_frame Target mbuffer for frame with multiple NAL units
- * @param mb_pkt   Input packet with STAP-A payload
- *
- * @return 0 if success, otherwise errorcode
- *
- * NOTE: The NAL header must be decoded outside
- */
-int h264_stap_decode_annexb(struct mbuf *mb_frame, struct mbuf *mb_pkt)
+static int stap_decode_annexb_int(struct mbuf *mb_frame, struct mbuf *mb_pkt,
+				  bool long_startcode)
 {
 	if (!mb_frame || !mb_pkt)
 		return EINVAL;
@@ -385,8 +389,13 @@ int h264_stap_decode_annexb(struct mbuf *mb_frame, struct mbuf *mb_pkt)
 #endif
 
 		static const uint8_t sc3[] = {0, 0, 1};
+		static const uint8_t sc4[] = {0, 0, 0, 1};
 
-		int err = mbuf_write_mem(mb_frame, sc3, sizeof(sc3));
+		int err;
+		if (long_startcode)
+			err = mbuf_write_mem(mb_frame, sc4, sizeof(sc4));
+		else
+			err = mbuf_write_mem(mb_frame, sc3, sizeof(sc3));
 		err |= mbuf_write_mem(mb_frame, mbuf_buf(mb_pkt), len);
 		if (err)
 			return err;
@@ -395,4 +404,37 @@ int h264_stap_decode_annexb(struct mbuf *mb_frame, struct mbuf *mb_pkt)
 	}
 
 	return 0;
+}
+
+
+/**
+ * Decode STAP-A payload and convert to Annex-B NAL units
+ *
+ * @param mb_frame Target mbuffer for frame with multiple NAL units
+ * @param mb_pkt   Input packet with STAP-A payload
+ *
+ * @return 0 if success, otherwise errorcode
+ *
+ * NOTE: The NAL header must be decoded outside
+ */
+int h264_stap_decode_annexb(struct mbuf *mb_frame, struct mbuf *mb_pkt)
+{
+	return stap_decode_annexb_int(mb_frame, mb_pkt, false);
+}
+
+
+/**
+ * Decode STAP-A payload and convert to Annex-B NAL units
+ * with long startcode (0x00 0x00 0x00 0x01).
+ *
+ * @param mb_frame Target mbuffer for frame with multiple NAL units
+ * @param mb_pkt   Input packet with STAP-A payload
+ *
+ * @return 0 if success, otherwise errorcode
+ *
+ * NOTE: The NAL header must be decoded outside
+ */
+int h264_stap_decode_annexb_long(struct mbuf *mb_frame, struct mbuf *mb_pkt)
+{
+	return stap_decode_annexb_int(mb_frame, mb_pkt, true);
 }

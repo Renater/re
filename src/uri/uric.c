@@ -40,7 +40,7 @@ static bool is_mark(int c)
 
 static bool is_unreserved(char c)
 {
-	return isalnum(c) || is_mark(c);
+	return isalnum((unsigned char)c) || is_mark(c);
 }
 
 
@@ -304,3 +304,4 @@ int uri_header_unescape(struct re_printf *pf, const struct pl *pl)
 {
 	return comp_unescape(pf, pl, is_hvalue);
 }
+

@@ -6,10 +6,18 @@
 #if defined(WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#if !defined(UNIX_PATH_MAX)
+#define UNIX_PATH_MAX 108
+typedef struct sockaddr_un {
+	ADDRESS_FAMILY sun_family;
+	char sun_path[UNIX_PATH_MAX];
+} SOCKADDR_UN, *PSOCKADDR_UN;
+#endif
 #else
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/un.h>
 #endif
 
 
@@ -27,10 +35,10 @@ struct sa {
 	union {
 		struct sockaddr sa;
 		struct sockaddr_in in;
-#ifdef HAVE_INET6
 		struct sockaddr_in6 in6;
+#if !defined(HAVE_UNIXSOCK) || HAVE_UNIXSOCK == 1
+		struct sockaddr_un un;
 #endif
-		uint8_t padding[28];
 	} u;
 	socklen_t len;
 };
@@ -60,10 +68,12 @@ bool     sa_cmp(const struct sa *l, const struct sa *r, int flag);
 
 bool     sa_is_linklocal(const struct sa *sa);
 bool     sa_is_loopback(const struct sa *sa);
+bool     sa_is_multicast(const struct sa *sa);
 bool     sa_is_any(const struct sa *sa);
 
 void     sa_set_scopeid(struct sa *sa, uint32_t scopeid);
 uint32_t sa_scopeid(const struct sa *sa);
+size_t   sa_struct_get_size(void);
 
 struct re_printf;
 int      sa_print_addr(struct re_printf *pf, const struct sa *sa);

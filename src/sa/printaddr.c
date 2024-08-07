@@ -6,7 +6,6 @@
 #ifdef HAVE_GETIFADDRS
 #include <sys/types.h>
 #include <sys/socket.h>
-#define __USE_MISC 1   /**< Use MISC code */
 #include <net/if.h>
 #endif
 #include <re_types.h>
@@ -31,7 +30,6 @@ int sa_print_addr(struct re_printf *pf, const struct sa *sa)
 
 	err = re_hprintf(pf, "%j", sa);
 
-#ifdef HAVE_INET6
 	if (sa_af(sa) == AF_INET6 && sa_is_linklocal(sa)) {
 #ifdef HAVE_GETIFADDRS
 		char ifname[IF_NAMESIZE];
@@ -45,7 +43,6 @@ int sa_print_addr(struct re_printf *pf, const struct sa *sa)
 		err |= re_hprintf(pf, "%%%d", scope_id);
 #endif
 	}
-#endif
 
 	return err;
 }

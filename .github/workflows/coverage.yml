@@ -12,37 +12,33 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
 
+    env:
+      CMAKE_GENERATOR: Ninja
+
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+
+    - name: fix flaky azure mirrors
+      if: ${{ runner.os == 'Linux' }}
+      run: |
+        sudo sed -i 's/azure\./de\./' /etc/apt/sources.list
+
+    - name: install packages
+      run: |
+        sudo apt-get update && sudo apt-get install -y ninja-build
 
     - name: make
       run: | 
-        cmake -B build -DCMAKE_C_FLAGS="--coverage" && cmake --build build -j
-
-    - uses: sreimers/pr-dependency-action@v0.5
-      with:
-        name: rem
-        repo: https://github.com/baresip/rem
-        secret: ${{ secrets.GITHUB_TOKEN }}
-        working-directory: '../.'
-
-    - uses: sreimers/pr-dependency-action@v0.5
-      with:
-        name: retest
-        repo: https://github.com/baresip/retest.git
-        secret: ${{ secrets.GITHUB_TOKEN }}
-        working-directory: '../.'
+        cmake -B build -DCMAKE_C_FLAGS="--coverage" -DCMAKE_EXE_LINKER_FLAGS="--coverage" -DUSE_TRACE=ON
+        cmake --build build -j -t retest
 
     - name: retest
       run: |
-        cd ..
-        cmake -S rem -B rem/build && cmake --build rem/build
-        cd retest; cmake -B build -DCMAKE_EXE_LINKER_FLAGS="--coverage" && \
-          cmake --build build -j && ./build/retest -v -a
+        ./build/test/retest -a -v
+        ./build/test/retest -r -m select -v
 
     - name: gcov
       run: | 
-        cd ../re
         gcov build/**/*.o
 
     - name: install gcovr
@@ -51,7 +47,18 @@ jobs:
 
     - name: coverage check
       run: |
-        min_cov="59.5"
-        cov=$(~/.local/bin/gcovr -r . -s | grep lines | awk '{ print $2 }' | sed 's/%//')
+        min_cov="64.6"
+        mkdir html
+        cov=$(~/.local/bin/gcovr -r . --html-details html/index.html --json-summary | jq .line_percent)
         echo "Coverage: ${cov}% (min $min_cov%)"
         exit $(echo "$cov < $min_cov" | bc -l)
+
+    - name: coverage zip
+      run: |
+        zip -r coverage.zip html
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: coverage
+        path: coverage.zip
+        retention-days: 7

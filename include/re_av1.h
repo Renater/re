@@ -30,10 +30,10 @@ enum obu_type {
  *    +-+-+-+-+-+-+-+-+
  */
 struct av1_obu_hdr {
-	unsigned type:4;  /**< OBU type       */
-	bool x;           /**< Extension flag */
-	bool s;           /**< Has size field */
-	size_t size;      /**< Payload size   */
+	enum obu_type type;  /**< OBU type       */
+	bool x;              /**< Extension flag */
+	bool s;              /**< Has size field */
+	size_t size;         /**< Payload size   */
 };
 
 int av1_leb128_encode(struct mbuf *mb, uint64_t value);
@@ -45,6 +45,7 @@ int av1_obu_print(struct re_printf *pf, const struct av1_obu_hdr *hdr);
 unsigned av1_obu_count(const uint8_t *buf, size_t size);
 unsigned av1_obu_count_rtp(const uint8_t *buf, size_t size);
 const char *av1_obu_name(enum obu_type type);
+bool obu_allowed_rtp(enum obu_type type);
 
 
 /*
@@ -56,12 +57,12 @@ typedef int (av1_packet_h)(bool marker, uint64_t rtp_ts,
 			    const uint8_t *pld, size_t pld_len,
 			    void *arg);
 
-int av1_packetize(bool *newp, bool marker, uint64_t rtp_ts,
-		  const uint8_t *buf, size_t len, size_t maxlen,
-		  av1_packet_h *pkth, void *arg);
 int av1_packetize_high(bool *newp, bool marker, uint64_t rtp_ts,
 		       const uint8_t *buf, size_t len, size_t maxlen,
 		       av1_packet_h *pkth, void *arg);
+int av1_packetize_one_w(bool *newp, bool marker, uint64_t rtp_ts,
+			const uint8_t *buf, size_t len, size_t maxlen,
+			av1_packet_h *pkth, void *arg);
 
 
 enum {

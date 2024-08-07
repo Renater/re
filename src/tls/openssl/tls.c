@@ -10,6 +10,7 @@
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/ec.h>
+#include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <re_types.h>
@@ -23,6 +24,7 @@
 #include <re_sys.h>
 #include <re_tcp.h>
 #include <re_tls.h>
+#include <re_thread.h>
 #include "tls.h"
 
 
@@ -44,10 +46,24 @@ struct tls {
 	X509 *cert;
 	char *pass;          /**< password for private key             */
 	bool verify_server;  /**< Enable SIP TLS server verification   */
+	bool verify_client;  /**< Enable SIP TLS client verification   */
 	struct session_reuse reuse;
+	struct list certs;   /**< Certificates for SNI selection       */
 };
 
-#if defined(TRACE_SSL) && (OPENSSL_VERSION_NUMBER >= 0x10101000L)
+/**
+ * A TLS certificate with private key, certificate chain and a host name that
+ * is passed to OpenSSL for the host name check
+ *
+ */
+struct tls_cert {
+	struct le le;
+	SSL_CTX *ctx;
+	char *host;
+};
+
+
+#if defined(TRACE_SSL)
 /**
  * Global flag if key material must be appended to file
  */
@@ -91,6 +107,7 @@ static void tls_keylogger_cb(const SSL *ssl,
 struct tls_conn {
 	SSL *ssl;
 	struct tls *tls;
+	struct tls_conn_d cd;
 };
 
 
@@ -110,6 +127,7 @@ static void destructor(void *data)
 	hash_flush(tls->reuse.ht_sessions);
 	mem_deref(tls->reuse.ht_sessions);
 	mem_deref(tls->pass);
+	list_flush(&tls->certs);
 }
 
 
@@ -144,9 +162,16 @@ static int keytype2int(enum tls_keytype type)
 }
 
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L && \
-	!defined(LIBRESSL_VERSION_NUMBER)
-static int verify_handler(int ok, X509_STORE_CTX *ctx)
+/**
+ * OpenSSL verify handler for debugging purposes. Prints only warnings in the
+ * default build
+ *
+ * @param ok  Verification result of OpenSSL
+ * @param ctx OpenSSL X509 store context set by OpenSSL
+ *
+ * @return passes parameter ok unchanged
+ */
+int tls_verify_handler(int ok, X509_STORE_CTX *ctx)
 {
 	int err, depth;
 
@@ -179,7 +204,93 @@ static int verify_handler(int ok, X509_STORE_CTX *ctx)
 
 	return ok;
 }
-#endif
+
+
+static int tls_verify_idx = -1;
+static once_flag oflag = ONCE_FLAG_INIT;
+
+static void tls_init_verify_idx(void)
+{
+	if (tls_verify_idx > -1)
+		return;
+
+	tls_verify_idx = SSL_get_ex_new_index(0, "tls verify ud",
+		NULL, NULL, NULL);
+}
+
+
+static int tls_ctx_alloc(SSL_CTX **ctxp, enum tls_method method,
+			 const char *certf, const char *pwd, struct tls *tls)
+{
+	int err = 0;
+	int r;
+	SSL_CTX *ctx;
+	int min_proto = 0;
+
+	switch (method) {
+
+	case TLS_METHOD_TLS:
+	case TLS_METHOD_SSLV23:
+		ctx	  = SSL_CTX_new(TLS_method());
+		min_proto = TLS1_2_VERSION;
+		break;
+
+	case TLS_METHOD_DTLS:
+	case TLS_METHOD_DTLSV1:
+	case TLS_METHOD_DTLSV1_2:
+		ctx = SSL_CTX_new(DTLS_method());
+		break;
+
+	default:
+		DEBUG_WARNING("tls method %d not supported\n", method);
+		return ENOSYS;
+	}
+
+	if (!ctx) {
+		ERR_clear_error();
+		return ENOMEM;
+	}
+
+	SSL_CTX_set_min_proto_version(ctx, min_proto);
+
+	if (!certf)
+		goto out;
+
+	/* Load our keys and certificates */
+	if (pwd && tls) {
+		err = str_dup(&tls->pass, pwd);
+		if (err)
+			goto out;
+
+		SSL_CTX_set_default_passwd_cb(ctx, password_cb);
+		SSL_CTX_set_default_passwd_cb_userdata(ctx, tls);
+	}
+
+	r = SSL_CTX_use_certificate_chain_file(ctx, certf);
+	if (r <= 0) {
+		DEBUG_WARNING("Can't read certificate file: %s (%d)\n", certf,
+			      r);
+		ERR_clear_error();
+		err = EINVAL;
+		goto out;
+	}
+
+	r = SSL_CTX_use_PrivateKey_file(ctx, certf, SSL_FILETYPE_PEM);
+	if (r <= 0) {
+		DEBUG_WARNING("Can't read key file: %s (%d)\n", certf, r);
+		ERR_clear_error();
+		err = EINVAL;
+		goto out;
+	}
+
+out:
+	if (err)
+		SSL_CTX_free(ctx);
+	else
+		*ctxp = ctx;
+
+	return err;
+}
 
 
 /**
@@ -196,7 +307,7 @@ int tls_alloc(struct tls **tlsp, enum tls_method method, const char *keyfile,
 	      const char *pwd)
 {
 	struct tls *tls;
-	int r, err;
+	int err;
 
 	if (!tlsp)
 		return EINVAL;
@@ -205,70 +316,21 @@ int tls_alloc(struct tls **tlsp, enum tls_method method, const char *keyfile,
 	if (!tls)
 		return ENOMEM;
 
+	err = tls_ctx_alloc(&tls->ctx, method, keyfile, pwd, tls);
+	if (err)
+		goto out;
+
 	tls->verify_server = true;
-	switch (method) {
 
-	case TLS_METHOD_TLS:
-	case TLS_METHOD_SSLV23:
-		tls->ctx = SSL_CTX_new(TLS_method());
-		break;
-
-	case TLS_METHOD_DTLS:
-	case TLS_METHOD_DTLSV1:
-	case TLS_METHOD_DTLSV1_2:
-		tls->ctx = SSL_CTX_new(DTLS_method());
-		break;
-
-	default:
-		DEBUG_WARNING("tls method %d not supported\n", method);
-		err = ENOSYS;
-		goto out;
-	}
-
-	if (!tls->ctx) {
-		ERR_clear_error();
-		err = ENOMEM;
-		goto out;
-	}
-
-#if defined(TRACE_SSL) && (OPENSSL_VERSION_NUMBER >= 0x10101000L)
+#if defined(TRACE_SSL)
 	SSL_CTX_set_keylog_callback(tls->ctx, tls_keylogger_cb);
 #endif
-
-	/* Load our keys and certificates */
-	if (keyfile) {
-		if (pwd) {
-			err = str_dup(&tls->pass, pwd);
-			if (err)
-				goto out;
-
-			SSL_CTX_set_default_passwd_cb(tls->ctx, password_cb);
-			SSL_CTX_set_default_passwd_cb_userdata(tls->ctx, tls);
-		}
-
-		r = SSL_CTX_use_certificate_chain_file(tls->ctx, keyfile);
-		if (r <= 0) {
-			DEBUG_WARNING("Can't read certificate file: %s (%d)\n",
-				      keyfile, r);
-			ERR_clear_error();
-			err = EINVAL;
-			goto out;
-		}
-
-		r = SSL_CTX_use_PrivateKey_file(tls->ctx, keyfile,
-						SSL_FILETYPE_PEM);
-		if (r <= 0) {
-			DEBUG_WARNING("Can't read key file: %s (%d)\n",
-				      keyfile, r);
-			ERR_clear_error();
-			err = EINVAL;
-			goto out;
-		}
-	}
 
 	err = hash_alloc(&tls->reuse.ht_sessions, 256);
 	if (err)
 		goto out;
+
+	call_once(&oflag, tls_init_verify_idx);
 
 	err = 0;
  out:
@@ -438,12 +500,7 @@ int tls_set_verify_purpose(struct tls *tls, const char *purpose)
 	if (!tls || !purpose)
 		return EINVAL;
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
 	i = X509_PURPOSE_get_by_sname(purpose);
-#else
-	i = X509_PURPOSE_get_by_sname((char *) purpose);
-#endif
-
 	if (i < 0)
 		return EINVAL;
 
@@ -489,15 +546,9 @@ static int tls_generate_cert(X509 **pcert, const char *cn)
 	    !X509_set_subject_name(cert, subj))
 		goto err;
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
 	if (!X509_gmtime_adj(X509_getm_notBefore(cert), -3600*24*365) ||
 	    !X509_gmtime_adj(X509_getm_notAfter(cert),   3600*24*365*10))
 		goto err;
-#else
-	if (!X509_gmtime_adj(X509_get_notBefore(cert), -3600*24*365) ||
-	    !X509_gmtime_adj(X509_get_notAfter(cert),   3600*24*365*10))
-		goto err;
-#endif
 
 	goto out;
 
@@ -556,11 +607,7 @@ int tls_set_selfsigned_ec(struct tls *tls, const char *cn, const char *curve_n)
 	if (!EC_KEY_generate_key(eckey))
 		goto out;
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
 	EC_KEY_set_asn1_flag(eckey, OPENSSL_EC_NAMED_CURVE);
-#else
-	EC_KEY_set_asn1_flag(eckey, 0);
-#endif
 
 	key = EVP_PKEY_new();
 	if (!key)
@@ -913,11 +960,12 @@ static int verify_trust_all(int ok, X509_STORE_CTX *ctx)
 
 
 /**
- * Set TLS server context to request certificate from client
+ * Set TLS server context to request certificate from peer
+ * and set trust all certificates of peer.
  *
  * @param tls    TLS Context
  */
-void tls_set_verify_client(struct tls *tls)
+void tls_set_verify_client_trust_all(struct tls *tls)
 {
 	if (!tls)
 		return;
@@ -925,6 +973,123 @@ void tls_set_verify_client(struct tls *tls)
 	SSL_CTX_set_verify_depth(tls->ctx, 0);
 	SSL_CTX_set_verify(tls->ctx, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE,
 			   verify_trust_all);
+}
+
+
+/**
+ * Set TLS server context to request certificate from peer
+ * and set trust all certificates of peer.
+ *
+ * @deprecated Use tls_set_verify_peer_trust_all instead
+ * @param tls    TLS Context
+ */
+void tls_set_verify_client(struct tls *tls)
+{
+	if (!tls)
+		return;
+
+	tls_set_verify_client_trust_all(tls);
+}
+
+
+static int tls_verify_handler_ud(int ok, X509_STORE_CTX *ctx)
+{
+	int ret = ok;
+	struct tls_conn_d *d;
+	SSL *ssl;
+	int err, depth;
+
+	err = X509_STORE_CTX_get_error(ctx);
+
+#if (DEBUG_LEVEL >= 6)
+	char    buf[128];
+	X509   *err_cert;
+
+	err_cert = X509_STORE_CTX_get_current_cert(ctx);
+
+	X509_NAME_oneline(X509_get_subject_name(err_cert), buf, 128);
+	DEBUG_INFO("%s: subject_name = %s\n", __func__, buf);
+
+	X509_NAME_oneline(X509_get_issuer_name(err_cert), buf, 128);
+	DEBUG_INFO("%s: issuer_name  = %s\n", __func__, buf);
+#endif
+	if (err) {
+		depth = X509_STORE_CTX_get_error_depth(ctx);
+		DEBUG_WARNING("%s: err          = %d\n", __func__, err);
+		DEBUG_WARNING("%s: error_string = %s\n", __func__,
+				X509_verify_cert_error_string(err));
+		DEBUG_WARNING("%s: depth        = %d\n", __func__, depth);
+	}
+
+#if (DEBUG_LEVEL >= 6)
+	DEBUG_INFO("tls_verify_handler ok = %d\n", ok);
+#endif
+
+	ssl = X509_STORE_CTX_get_ex_data(ctx,
+		SSL_get_ex_data_X509_STORE_CTX_idx());
+
+	if (!ssl) {
+		DEBUG_WARNING("X509_STORE_CTX_get_ex_data (SSL*) failed\n");
+		return ret;
+	}
+
+	d = SSL_get_ex_data(ssl, tls_verify_idx);
+	if (!d) {
+		DEBUG_WARNING("SSL_get_app_data (struct tls_conn_d) failed\n");
+		return ret;
+	}
+
+	if (d->verifyh)
+		ret = d->verifyh(ok, d->arg);
+
+	return ret;
+}
+
+
+/**
+ * Enable request certificate from peer in TLS server connection
+ * Set verify handler.
+ *
+ * @param tc      TLS connection
+ * @param depth   Max depth certificate chain accepted.
+ *                A negative depth uses default depth.
+ * @param verifyh SSL verify handler. If NULL default verify handler is used.
+ * @param arg     Handler argument
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int tls_set_verify_client_handler(struct tls_conn *tc, int depth,
+	int (*verifyh) (int ok, void *arg), void *arg)
+{
+#if !defined(LIBRESSL_VERSION_NUMBER)
+	int err = 0;
+	SSL_verify_cb tls_cb = tls_verify_handler_ud;
+	if (!tc)
+		return EINVAL;
+
+	if (!verifyh) {
+		tls_cb = tls_verify_handler;
+	}
+	else {
+		tc->cd.verifyh = verifyh;
+		tc->cd.arg = arg;
+		SSL_set_ex_data(tc->ssl, tls_verify_idx, &tc->cd);
+	}
+
+	SSL_set_verify_depth(tc->ssl, depth < 0 ?
+		SSL_get_verify_depth(tc->ssl) : depth);
+	SSL_set_verify(tc->ssl, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE,
+		tls_cb);
+
+	return err;
+#else
+	(void) tc;
+	(void) depth;
+	(void) verifyh;
+	(void) arg;
+	(void) tls_verify_handler_ud;
+	return ENOSYS;
+#endif
 }
 
 
@@ -938,7 +1103,6 @@ void tls_set_verify_client(struct tls *tls)
  */
 int tls_set_srtp(struct tls *tls, const char *suites)
 {
-#ifdef USE_OPENSSL_SRTP
 	if (!tls || !suites)
 		return EINVAL;
 
@@ -948,12 +1112,6 @@ int tls_set_srtp(struct tls *tls, const char *suites)
 	}
 
 	return 0;
-#else
-	(void)tls;
-	(void)suites;
-
-	return ENOSYS;
-#endif
 }
 
 
@@ -1114,7 +1272,6 @@ int tls_srtp_keyinfo(const struct tls_conn *tc, enum srtp_suite *suite,
 		     uint8_t *cli_key, size_t cli_key_size,
 		     uint8_t *srv_key, size_t srv_key_size)
 {
-#ifdef USE_OPENSSL_SRTP
 	static const char *label = "EXTRACTOR-dtls_srtp";
 	size_t key_size, salt_size, size;
 	SRTP_PROTECTION_PROFILE *sel;
@@ -1185,16 +1342,6 @@ int tls_srtp_keyinfo(const struct tls_conn *tc, enum srtp_suite *suite,
 	mem_secclean(keymat, sizeof(keymat));
 
 	return 0;
-#else
-	(void)tc;
-	(void)suite;
-	(void)cli_key;
-	(void)cli_key_size;
-	(void)srv_key;
-	(void)srv_key_size;
-
-	return ENOSYS;
-#endif
 }
 
 
@@ -1271,8 +1418,6 @@ int tls_set_ciphers(struct tls *tls, const char *cipherv[], size_t count)
  */
 int tls_set_verify_server(struct tls_conn *tc, const char *host)
 {
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L && \
-	!defined(LIBRESSL_VERSION_NUMBER)
 	struct sa sa;
 
 	if (!tc || !host)
@@ -1298,12 +1443,35 @@ int tls_set_verify_server(struct tls_conn *tc, const char *host)
 		}
 	}
 
-	SSL_set_verify(tc->ssl, SSL_VERIFY_PEER, verify_handler);
+	SSL_set_verify(tc->ssl, SSL_VERIFY_PEER, tls_verify_handler);
+
+	return 0;
+}
+
+
+/**
+ * Enable verification of client certificate
+ *
+ * @param tc   TLS Connection
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int tls_verify_client(struct tls_conn *tc)
+{
+#if !defined(LIBRESSL_VERSION_NUMBER)
+
+	if (!tc)
+		return EINVAL;
+
+	if (!tc->tls->verify_client)
+		return 0;
+
+	SSL_set_verify(tc->ssl, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE,
+		       tls_verify_handler);
 
 	return 0;
 #else
 	(void)tc;
-	(void)host;
 
 	return ENOSYS;
 #endif
@@ -1371,14 +1539,14 @@ static int convert_X509_NAME_to_mbuf(X509_NAME *field, struct mbuf *mb,
 
 
 /**
- * Extract a X509 certficate issuer/subject and write the result into an mbuf
+ * Extract a X509 certificate issuer/subject and write the result into an mbuf
  *
  * @param tls           TLS Object
  * @param mb            Memory buffer
  * @param field_getter  Functionpointer to the X509 getter function
  * @param flags         X509_NAME_print_ex flags
  *
- * @return 0 if success, othewise errorcode
+ * @return 0 if success, otherwise errorcode
  */
 static int tls_get_ca_chain_field(struct tls *tls, struct mbuf *mb,
 	tls_get_certfield_h *field_getter, unsigned long flags)
@@ -1449,6 +1617,21 @@ void tls_disable_verify_server(struct tls *tls)
 
 
 /**
+ * Enables SIP TLS client verifications for following requests
+ *
+ * @param tls     TLS Object
+ * @param enable  true to enable client verification, false to disable
+ */
+void tls_enable_verify_client(struct tls *tls, bool enable)
+{
+	if (!tls)
+		return;
+
+	tls->verify_client = enable;
+}
+
+
+/**
  * Set minimum TLS version
  *
  * @param tls     TLS Object
@@ -1461,14 +1644,10 @@ int tls_set_min_proto_version(struct tls *tls, int version)
 	if (!tls)
 		return EINVAL;
 
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
 	if (SSL_CTX_set_min_proto_version(tls->ctx, version))
 		return 0;
-#else
-	(void) version;
-#endif
-	return EACCES;
 
+	return EACCES;
 }
 
 
@@ -1485,12 +1664,9 @@ int tls_set_max_proto_version(struct tls *tls, int version)
 	if (!tls)
 		return EINVAL;
 
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
 	if (SSL_CTX_set_max_proto_version(tls->ctx, version))
 		return 0;
-#else
-	(void) version;
-#endif
+
 	return EACCES;
 }
 
@@ -1679,11 +1855,7 @@ bool tls_session_reused(const struct tls_conn *tc)
 	if (!tc)
 		return false;
 
-#if (OPENSSL_VERSION_NUMBER >= 0x10101000L)
 	return SSL_session_reused(tc->ssl);
-#else
-	return false;
-#endif
 }
 
 
@@ -1778,4 +1950,355 @@ SSL_CTX *tls_ssl_ctx(const struct tls *tls)
 		return NULL;
 
 	return tls->ctx;
+}
+
+
+static void tls_cert_destructor(void *arg)
+{
+	struct tls_cert *uc = arg;
+
+	mem_deref(uc->host);
+	if (uc->ctx)
+		SSL_CTX_free(uc->ctx);
+}
+
+
+/**
+ * Adds a certificate for Server Name Indication (SNI) based certificate
+ * selection. An incoming client hello may contain an SNI extension which
+ * is used to select a local server certificate
+ *
+ * @param tls   TLS context
+ * @param certf Filename of the certificate
+ * @param host  Hostname that should match the SNI from client hello
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int tls_add_certf(struct tls *tls, const char *certf, const char *host)
+{
+	struct tls_cert *uc;
+	int err = 0;
+
+	if (!tls || !certf)
+		return EINVAL;
+
+	uc = mem_zalloc(sizeof(*uc), tls_cert_destructor);
+	if (!uc)
+		return ENOMEM;
+
+	if (str_isset(host)) {
+		err = str_dup(&uc->host, host);
+		if (err)
+			goto err;
+	}
+
+	err = tls_ctx_alloc(&uc->ctx, TLS_METHOD_TLS, certf, NULL, NULL);
+	if (err)
+		goto err;
+
+	X509_STORE *ca = SSL_CTX_get_cert_store(tls->ctx);
+	if (ca) {
+		X509_STORE_up_ref(ca);
+		SSL_CTX_set_cert_store(uc->ctx, ca);
+	}
+
+	list_append(&tls->certs, &uc->le, uc);
+	if (list_count(&tls->certs) == 1)
+		tls_enable_sni(tls);
+
+	return 0;
+
+err:
+	ERR_clear_error();
+	mem_deref(uc);
+
+	return err;
+}
+
+
+/**
+ * Returns the X509 of the TLS certificate
+ *
+ * @param hc  TLS certificate
+ *
+ * @return The OpenSSL X509
+ */
+X509 *tls_cert_x509(struct tls_cert *hc)
+{
+	return hc ? SSL_CTX_get0_certificate(hc->ctx) : NULL;
+}
+
+
+SSL_CTX *tls_cert_ctx(struct tls_cert *hc) {
+
+	return hc ? hc->ctx : NULL;
+}
+
+/**
+ * Returns the host name of the TLS certificate
+ *
+ * @param hc  TLS certificate
+ *
+ * @return The host name
+ */
+const char *tls_cert_host(struct tls_cert *hc)
+{
+	return hc ? hc->host : NULL;
+}
+
+
+/**
+ * Returns the list of TLS certificates
+ *
+ * @param tls TLS context
+ *
+ * @return The list
+ */
+const struct list *tls_certs(const struct tls *tls)
+{
+	return tls ? &tls->certs : NULL;
+}
+
+
+/**
+ * Enable/disable posthandshake
+ * Only on client side for TLSv1.3
+ *
+ * @param tls  tls object
+ * @param value posthandshake auth value. 1 enabled, Default: 0
+ *
+ */
+void tls_set_posthandshake_auth(struct tls *tls, int value)
+{
+	if (!tls)
+		return;
+
+	SSL_CTX_set_post_handshake_auth(tls->ctx, value);
+}
+
+
+/**
+ * Request client certificate using post handshake
+ * Only on client side for TLSv1.3
+ *
+ * @param tc  tls connection
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int tls_verify_client_post_handshake(struct tls_conn *tc)
+{
+	int ret;
+	int err = 0;
+	if (!tc || !tc->ssl)
+		return EINVAL;
+
+	if (!(ret=SSL_verify_client_post_handshake(tc->ssl))) {
+		err = EFAULT;
+		DEBUG_WARNING("SSL_verify_client_post_handshake error: "\
+			"%m, ssl_err=%d\n", err, SSL_get_error(tc->ssl, ret));
+		ERR_clear_error();
+		return err;
+	}
+
+	if (!(ret = SSL_do_handshake(tc->ssl))) {
+		err = EIO;
+		DEBUG_WARNING("SSL_do_handshake error: "\
+			"%m, ssl_err=%d\n", err, SSL_get_error(tc->ssl, ret));
+		ERR_clear_error();
+	}
+
+	return err;
+}
+
+
+/**
+ * Set TLS session resumption mode
+ *
+ * @param tls  TLS Object
+ * @param mode TLS session resumption mode
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int tls_set_resumption(struct tls *tls, const enum tls_resume_mode mode)
+{
+	long ok = 1;
+
+	if (!tls)
+		return EINVAL;
+
+	if (mode & TLS_RESUMPTION_IDS) {
+		ok = SSL_CTX_set_session_cache_mode(tls->ctx,
+						    SSL_SESS_CACHE_SERVER);
+	}
+	else {
+		ok = SSL_CTX_set_session_cache_mode(tls->ctx,
+						    SSL_SESS_CACHE_OFF);
+	}
+
+	if (mode & TLS_RESUMPTION_TICKETS) {
+		ok |= SSL_CTX_clear_options(tls->ctx, SSL_OP_NO_TICKET);
+		ok |= SSL_CTX_set_num_tickets(tls->ctx, 2);
+	}
+	else {
+		ok |= SSL_CTX_set_options(tls->ctx, SSL_OP_NO_TICKET);
+		ok |= SSL_CTX_set_num_tickets(tls->ctx, 0);
+	}
+
+	if (!ok) {
+		ERR_clear_error();
+		return EFAULT;
+	}
+
+	return 0;
+}
+
+
+/**
+ * Change used certificate+key of an existing SSL object
+ *
+ * @param tls       TLS Object
+ * @param chain     Cert (chain) + Key in PEM format
+ * @param len_chain Length of certificate + key PEM string
+ *
+ * @return int 0 if success, otherwise errorcode
+ */
+int tls_set_certificate_chain_pem(struct tls *tls, const char *chain,
+				  size_t len_chain)
+{
+	STACK_OF(X509) *cert_stack = NULL;
+	BIO *bio_mem = NULL;
+	EVP_PKEY *pkey = NULL;
+	X509 *leaf_cert = NULL;
+	int err = ENOMEM;
+
+	if (!tls || !chain || !len_chain)
+		return EINVAL;
+
+	bio_mem = BIO_new_mem_buf(chain, (int)len_chain);
+	cert_stack = sk_X509_new_null();
+	if (!bio_mem || !cert_stack)
+		goto out;
+
+	X509 *cert;
+	while ((cert = PEM_read_bio_X509(bio_mem, NULL, NULL, NULL)) != NULL) {
+		int n = sk_X509_push(cert_stack, cert);
+		if (n < 1) {
+			X509_free(cert);
+			goto out;
+		}
+	}
+
+	err = EINVAL;
+
+	if (sk_X509_num(cert_stack) == 0)
+		goto out;
+
+	leaf_cert = sk_X509_shift(cert_stack);
+	long ok = SSL_CTX_use_certificate(tls->ctx, leaf_cert);
+	if (ok <= 0) {
+		X509_free(leaf_cert);
+		goto out;
+	}
+
+	if (sk_X509_num(cert_stack)) {
+		ok = SSL_CTX_clear_chain_certs(tls->ctx);
+		if (!ok)
+			goto out;
+
+		while((cert = sk_X509_shift(cert_stack)) != NULL){
+			ok = SSL_CTX_add0_chain_cert(tls->ctx, cert);
+			if (!ok) {
+				X509_free(cert);
+				goto out;
+			}
+		}
+	}
+
+	BIO_free(bio_mem);
+	bio_mem = BIO_new_mem_buf(chain, (int)len_chain);
+	if (!bio_mem) {
+		err = ENOMEM;
+		goto out;
+	}
+
+	pkey = PEM_read_bio_PrivateKey(bio_mem, NULL, NULL, NULL);
+	if (!pkey)
+		goto out;
+
+	ok = SSL_CTX_use_PrivateKey(tls->ctx, pkey);
+	if (ok <= 0) {
+		err = EKEYREJECTED;
+		goto out;
+	}
+
+	ok = SSL_CTX_check_private_key(tls->ctx);
+	if (ok <= 0)
+		goto out;
+
+	if (tls->cert)
+		X509_free(tls->cert);
+
+	tls->cert = leaf_cert;
+	leaf_cert = NULL;
+
+	err = 0;
+
+out:
+	if (bio_mem)
+		BIO_free(bio_mem);
+	if (leaf_cert)
+		X509_free(leaf_cert);
+	if (cert_stack)
+		sk_X509_pop_free(cert_stack, X509_free);
+	if (pkey)
+		EVP_PKEY_free(pkey);
+	if (err)
+		ERR_clear_error();
+
+	return err;
+}
+
+
+/**
+ * Change used certificate+key of an existing SSL object
+ *
+ * @param tls  TLS Object
+ * @param path Path to Cert (chain) + Key file (PEM format)
+ *
+ * @return int 0 if success, otherwise errorcode
+ */
+int tls_set_certificate_chain(struct tls *tls, const char *path)
+{
+	X509 *cert;
+	int ok = 0;
+
+	if (!tls || !path)
+		return EINVAL;
+
+	ok = SSL_CTX_use_certificate_chain_file(tls->ctx, path);
+	if (ok <= 0) {
+		ERR_clear_error();
+		return ENOENT;
+	}
+
+	ok = SSL_CTX_use_PrivateKey_file(tls->ctx, path, SSL_FILETYPE_PEM);
+	if (ok <= 0) {
+		ERR_clear_error();
+		return EKEYREJECTED;
+	}
+
+	cert = SSL_CTX_get0_certificate(tls->ctx);
+	if (!cert) {
+		ERR_clear_error();
+		return ENOENT;
+	}
+
+	X509_up_ref(cert);
+
+	if (tls->cert)
+		X509_free(tls->cert);
+
+	tls->cert = cert;
+
+	return 0;
 }

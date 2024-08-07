@@ -26,12 +26,6 @@
 #define INET6_ADDRSTRLEN 46
 #endif
 
-/** Length of IPv4/v6 address string */
-#ifdef HAVE_INET6
-#define NET_ADDRSTRLEN INET6_ADDRSTRLEN
-#else
-#define NET_ADDRSTRLEN INET_ADDRSTRLEN
-#endif
 
 /* forward declarations */
 struct sa;
@@ -51,6 +45,7 @@ void net_sock_close(void);
 /* Net socket options */
 int net_sockopt_blocking_set(re_sock_t fd, bool blocking);
 int net_sockopt_reuse_set(re_sock_t fd, bool reuse);
+int net_sockopt_v6only(re_sock_t fd, bool only);
 
 
 /* Net interface (if.c) */

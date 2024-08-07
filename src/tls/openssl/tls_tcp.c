@@ -28,6 +28,7 @@
 struct tls_conn {
 	SSL *ssl;             /* inheritance */
 	struct tls *tls;      /* inheritance */
+	struct tls_conn_d cd; /* inheritance */
 	BIO_METHOD *biomet;
 	BIO *sbio_out;
 	BIO *sbio_in;
@@ -229,7 +230,7 @@ static bool recv_handler(int *err, struct mbuf *mb, bool *estab, void *arg)
 
 	if (SSL_state(tc->ssl) != SSL_ST_OK) {
 
-		if (tc->up) {
+		if (tc->up && !SSL_get_secure_renegotiation_support(tc->ssl)) {
 			*err = EPROTO;
 			return true;
 		}
@@ -331,8 +332,7 @@ int tls_conn_change_cert(struct tls_conn *tc, const char *file)
 	SSL_certs_clear(tc->ssl);
 #endif
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L && \
-	!defined(LIBRESSL_VERSION_NUMBER)
+#if !defined(LIBRESSL_VERSION_NUMBER)
 	r = SSL_use_certificate_chain_file(tc->ssl, file);
 #else
 	r = SSL_use_certificate_file(tc->ssl, file, SSL_FILETYPE_PEM);

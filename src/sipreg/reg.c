@@ -36,6 +36,7 @@ struct sipreg {
 	struct sip_auth *auth;
 	struct mbuf *hdrs;
 	char *cuser;
+	char *cparams;
 	sip_resp_h *resph;
 	void *arg;
 	uint32_t expires;
@@ -93,6 +94,7 @@ static void destructor(void *arg)
 	mem_deref(reg->sip);
 	mem_deref(reg->hdrs);
 	mem_deref(reg->params);
+	mem_deref(reg->cparams);
 }
 
 
@@ -191,6 +193,7 @@ static void response_handler(int err, const struct sip_msg *msg, void *arg)
 {
 	const struct sip_hdr *minexp;
 	struct sipreg *reg = arg;
+	uint16_t last_scode = reg->ls.last_scode;
 
 	reg->wait = failwait(reg->failc + 1);
 	if (err || !msg || sip_request_loops(&reg->ls, msg->scode)) {
@@ -212,48 +215,53 @@ static void response_handler(int err, const struct sip_msg *msg, void *arg)
 
 		if (reg->regid > 0 && !reg->terminated && !reg->ka)
 			start_outbound(reg, msg);
+		goto out;
 	}
-	else {
-		if (reg->terminated && !reg->registered)
+
+	if (reg->terminated && !reg->registered)
+		goto out;
+
+	switch (msg->scode) {
+
+	case 401:
+	case 407:
+		if (reg->ls.failc > 1 && last_scode == msg->scode) {
+			reg->failc++;
 			goto out;
-
-		switch (msg->scode) {
-
-		case 401:
-		case 407:
-			sip_auth_reset(reg->auth);
-			err = sip_auth_authenticate(reg->auth, msg);
-			if (err) {
-				err = (err == EAUTH) ? 0 : err;
-				break;
-			}
-
-			err = request(reg, false);
-			if (err)
-				break;
-
-			return;
-
-		case 403:
-			sip_auth_reset(reg->auth);
-			break;
-
-		case 423:
-			minexp = sip_msg_hdr(msg, SIP_HDR_MIN_EXPIRES);
-			if (!minexp || !pl_u32(&minexp->val) || !reg->expires)
-				break;
-
-			reg->expires = pl_u32(&minexp->val);
-
-			err = request(reg, false);
-			if (err)
-				break;
-
-			return;
 		}
 
-		++reg->failc;
+		sip_auth_reset(reg->auth);
+		err = sip_auth_authenticate(reg->auth, msg);
+		if (err) {
+			err = (err == EAUTH) ? 0 : err;
+			break;
+		}
+
+		err = request(reg, false);
+		if (err)
+			break;
+
+		return;
+
+	case 403:
+		sip_auth_reset(reg->auth);
+		break;
+
+	case 423:
+		minexp = sip_msg_hdr(msg, SIP_HDR_MIN_EXPIRES);
+		if (!minexp || !pl_u32(&minexp->val) || !reg->expires)
+			break;
+
+		reg->expires = pl_u32(&minexp->val);
+
+		err = request(reg, false);
+		if (err)
+			break;
+
+		return;
 	}
+
+	++reg->failc;
 
  out:
 	if (!reg->expires) {
@@ -293,14 +301,17 @@ static int send_handler(enum sip_transp tp, struct sa *src,
 	int err;
 
 	(void)contp;
+	(void)dst;
 
 	reg->tp = tp;
 	if (reg->srcport && tp != SIP_TRANSP_UDP)
 		sa_set_port(src, reg->srcport);
 
 	reg->laddr = *src;
-	err = mbuf_printf(mb, "Contact: <sip:%s@%J%s>;expires=%u%s%s",
+	err = mbuf_printf(mb, "Contact: <sip:%s@%J%s%s%s>;expires=%u%s%s",
 			  reg->cuser, &reg->laddr, sip_transp_param(reg->tp),
+			  reg->cparams ? ";" : "",
+			  reg->cparams ? reg->cparams : "",
 			  reg->expires,
 			  reg->params ? ";" : "",
 			  reg->params ? reg->params : "");
@@ -309,14 +320,6 @@ static int send_handler(enum sip_transp tp, struct sa *src,
 		err |= mbuf_printf(mb, ";reg-id=%d", reg->regid);
 
 	err |= mbuf_printf(mb, "\r\n");
-
-	if (reg->srcport) {
-		struct sip_conncfg cfg;
-		memset(&cfg, 0, sizeof(cfg));
-		cfg.srcport = reg->srcport;
-		err = sip_conncfg_set(reg->sip, dst, &cfg);
-	}
-
 	return err;
 }
 
@@ -614,8 +617,27 @@ int sipreg_set_fbregint(struct sipreg *reg, uint32_t fbregint)
  */
 void sipreg_set_srcport(struct sipreg *reg, uint16_t srcport)
 {
-	if (!reg)
+	if (!reg || !reg->dlg)
 		return;
 
 	reg->srcport = srcport;
+
+	sip_dialog_set_srcport(reg->dlg, srcport);
+}
+
+
+/**
+ * Set contact URI optional parameters
+ *
+ * @param reg      SIP registration client
+ * @param cparams  Contact URI optional parameters
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int sipreg_set_contact_params(struct sipreg *reg, const char *cparams)
+{
+	if (!reg)
+		return EINVAL;
+
+	return str_dup(&reg->cparams, cparams);
 }

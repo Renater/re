@@ -55,24 +55,21 @@ struct rtcp_sess {
 	uint32_t senderc;           /**< Number of senders                   */
 	uint32_t srate_tx;          /**< Transmit sampling rate              */
 	uint32_t srate_rx;          /**< Receive sampling rate               */
+	uint32_t interval;          /**< RTCP interval in [ms]               */
+	mtx_t *lock;                /**< Lock for rtcp_sess                  */
 
 	/* stats */
-	mtx_t *lock;                /**< Lock for txstat                     */
 	struct txstat txstat;       /**< Local transmit statistics           */
 };
 
 
 /* Prototypes */
 static void schedule(struct rtcp_sess *sess);
-static int  send_bye_packet(struct rtcp_sess *sess);
 
 
 static void sess_destructor(void *data)
 {
 	struct rtcp_sess *sess = data;
-
-	if (sess->cname)
-		(void)send_bye_packet(sess);
 
 	tmr_cancel(&sess->tmr);
 
@@ -104,10 +101,16 @@ static struct rtp_member *get_member(struct rtcp_sess *sess, uint32_t src)
 }
 
 
-/** Calculate Round-Trip Time in [microseconds] */
-static void calc_rtt(uint32_t *rtt, uint32_t lsr, uint32_t dlsr)
+/**
+ * Calculate Round-Trip Time in [microseconds]
+ *
+ * @param rtt  Calculated Rount-Trip time [us]
+ * @param lsr  Last SR packet from this source [compact NTP timestamp]
+ * @param dlsr Delay since last SR packet [units of 1/65536 seconds]
+ */
+void rtcp_calc_rtt(uint32_t *rtt, uint32_t lsr, uint32_t dlsr)
 {
-	struct ntp_time ntp_time;
+	struct rtp_ntp_time ntp_time;
 	uint64_t a_us, lsr_us, dlsr_us;
 
 	ntp_time_get(&ntp_time, NULL);
@@ -117,7 +120,8 @@ static void calc_rtt(uint32_t *rtt, uint32_t lsr, uint32_t dlsr)
 	dlsr_us = 1000000ULL * dlsr / 65536;
 
 	/* RTT delay is (A - LSR - DLSR) */
-	*rtt = MAX((int)(a_us - lsr_us - dlsr_us), 0);
+	if (rtt)
+		*rtt = MAX((int)(a_us - lsr_us - dlsr_us), 0);
 }
 
 
@@ -134,7 +138,7 @@ static void handle_rr_block(struct rtcp_sess *sess, struct rtp_member *mbr,
 
 	/* round-trip propagation delay as (A - LSR - DLSR) */
 	if (rr->lsr && rr->dlsr)
-		calc_rtt(&mbr->rtt, rr->lsr, rr->dlsr);
+		rtcp_calc_rtt(&mbr->rtt, rr->lsr, rr->dlsr);
 }
 
 
@@ -211,6 +215,7 @@ void rtcp_handler(struct rtcp_sess *sess, struct rtcp_msg *msg)
 	if (!sess || !msg)
 		return;
 
+	mtx_lock(sess->lock);
 	switch (msg->hdr.pt) {
 
 	case RTCP_SR:
@@ -228,6 +233,8 @@ void rtcp_handler(struct rtcp_sess *sess, struct rtcp_msg *msg)
 	default:
 		break;
 	}
+
+	mtx_unlock(sess->lock);
 }
 
 
@@ -245,6 +252,8 @@ int rtcp_sess_alloc(struct rtcp_sess **sessp, struct rtp_sock *rs)
 
 	sess->rs = rs;
 	tmr_init(&sess->tmr);
+
+	sess->interval = RTCP_INTERVAL;
 
 	err = mutex_alloc(&sess->lock);
 	if (err)
@@ -265,6 +274,22 @@ int rtcp_sess_alloc(struct rtcp_sess **sessp, struct rtp_sock *rs)
 
 
 /**
+ * Set interval between sending reports on an RTCP Session
+ *
+ * @param rs  RTP Socket
+ * @param n   RTCP interval in [ms]
+ */
+void rtcp_set_interval(struct rtp_sock *rs, uint32_t n)
+{
+	struct rtcp_sess *sess = rtp_rtcp_sess(rs);
+	if (!sess)
+		return;
+
+	sess->interval = n;
+}
+
+
+/**
  * Set the Sampling-rate on an RTCP Session
  *
  * @param rs       RTP Socket
@@ -277,8 +302,10 @@ void rtcp_set_srate(struct rtp_sock *rs, uint32_t srate_tx, uint32_t srate_rx)
 	if (!sess)
 		return;
 
+	mtx_lock(sess->lock);
 	sess->srate_tx = srate_tx;
 	sess->srate_rx = srate_rx;
+	mtx_unlock(sess->lock);
 }
 
 
@@ -310,7 +337,9 @@ void rtcp_set_srate_rx(struct rtp_sock *rs, uint32_t srate_rx)
 	if (!sess)
 		return;
 
+	mtx_lock(sess->lock);
 	sess->srate_rx = srate_rx;
+	mtx_unlock(sess->lock);
 }
 
 
@@ -321,8 +350,10 @@ int rtcp_enable(struct rtcp_sess *sess, bool enabled, const char *cname)
 	if (!sess)
 		return EINVAL;
 
+	mtx_lock(sess->lock);
 	sess->cname = mem_deref(sess->cname);
 	err = str_dup(&sess->cname, cname);
+	mtx_unlock(sess->lock);
 	if (err)
 		return err;
 
@@ -336,7 +367,7 @@ int rtcp_enable(struct rtcp_sess *sess, bool enabled, const char *cname)
 
 
 /** Calculate LSR (middle 32 bits out of 64 in the NTP timestamp) */
-static uint32_t calc_lsr(const struct ntp_time *last_sr)
+static uint32_t calc_lsr(const struct rtp_ntp_time *last_sr)
 {
 	return last_sr->hi ? ntp_compact(last_sr) : 0;
 }
@@ -366,8 +397,8 @@ static bool sender_apply_handler(struct le *le, void *arg)
 
 	/* Initialise the members */
 	rr.ssrc     = mbr->src;
-	rr.fraction = source_calc_fraction_lost(s);
-	rr.lost     = source_calc_lost(s);
+	rr.fraction = rtp_source_calc_fraction_lost(s);
+	rr.lost     = rtp_source_calc_lost(s);
 	rr.last_seq = s->cycles | s->max_seq;
 	rr.jitter   = s->jitter >> 4;
 	rr.lsr      = calc_lsr(&s->last_sr);
@@ -401,7 +432,7 @@ static int mk_sr(struct rtcp_sess *sess, struct mbuf *mb)
 	mtx_unlock(sess->lock);
 
 	if (txstat.jfs_rt_ref) {
-		struct ntp_time ntp;
+		struct rtp_ntp_time ntp;
 		uint64_t jfs_rt, dur;
 		uint32_t rtp_ts;
 
@@ -431,9 +462,14 @@ static int mk_sr(struct rtcp_sess *sess, struct mbuf *mb)
 static int sdes_encode_handler(struct mbuf *mb, void *arg)
 {
 	struct rtcp_sess *sess = arg;
+	int err;
 
-	return rtcp_sdes_encode(mb, rtp_sess_ssrc(sess->rs), 1,
+	mtx_lock(sess->lock);
+	err = rtcp_sdes_encode(mb, rtp_sess_ssrc(sess->rs), 1,
 				RTCP_SDES_CNAME, sess->cname);
+	mtx_unlock(sess->lock);
+
+	return err;
 }
 
 
@@ -469,9 +505,13 @@ static int send_rtcp_report(struct rtcp_sess *sess)
 }
 
 
-static int send_bye_packet(struct rtcp_sess *sess)
+int rtcp_send_bye_packet(struct rtp_sock *rs)
 {
-	const uint32_t ssrc = rtp_sess_ssrc(sess->rs);
+	if (!rs)
+		return EINVAL;
+
+	struct rtcp_sess *sess = rtp_rtcp_sess(rs);
+	const uint32_t ssrc = rtp_sess_ssrc(rs);
 	struct mbuf *mb;
 	int err;
 
@@ -512,7 +552,7 @@ static void timeout(void *arg)
 
 static void schedule(struct rtcp_sess *sess)
 {
-	tmr_start(&sess->tmr, RTCP_INTERVAL, timeout, sess);
+	tmr_start(&sess->tmr, sess->interval, timeout, sess);
 }
 
 
@@ -537,50 +577,58 @@ void rtcp_sess_tx_rtp(struct rtcp_sess *sess, uint32_t ts, uint64_t jfs_rt,
 }
 
 
-void rtcp_sess_rx_rtp(struct rtcp_sess *sess, uint16_t seq, uint32_t ts,
-		      uint32_t ssrc, size_t payload_size,
-		      const struct sa *peer)
+void rtcp_sess_rx_rtp(struct rtcp_sess *sess, struct rtp_header *hdr,
+		      size_t payload_size, const struct sa *peer)
 {
 	struct rtp_member *mbr;
 
 	if (!sess)
 		return;
 
-	mbr = get_member(sess, ssrc);
+	mtx_lock(sess->lock);
+	mbr = get_member(sess, hdr->ssrc);
 	if (!mbr) {
-		DEBUG_NOTICE("could not add member: 0x%08x\n", ssrc);
-		return;
+		DEBUG_NOTICE("could not add member: 0x%08x\n", hdr->ssrc);
+		goto out;
 	}
 
 	if (!mbr->s) {
 		mbr->s = mem_zalloc(sizeof(*mbr->s), NULL);
 		if (!mbr->s) {
-			DEBUG_NOTICE("could not add sender: 0x%08x\n", ssrc);
-			return;
+			DEBUG_NOTICE("could not add sender: 0x%08x\n",
+				     hdr->ssrc);
+			goto out;
 		}
 
 		/* first packet - init sequence number */
-		source_init_seq(mbr->s, seq);
+		rtp_source_init_seq(mbr->s, hdr->seq);
 		/* probation not used */
 		sa_cpy(&mbr->s->rtp_peer, peer);
 		++sess->senderc;
 	}
 
-	if (!source_update_seq(mbr->s, seq)) {
-		DEBUG_WARNING("rtp_update_seq() returned 0\n");
+	if (!rtp_source_update_seq(mbr->s, hdr->seq)) {
+		DEBUG_WARNING("rtp_source_update_seq() returned 0\n");
 	}
 
 	if (sess->srate_rx) {
-
-		uint64_t ts_arrive;
-
 		/* Convert from wall-clock time to timestamp units */
-		ts_arrive = tmr_jiffies() * sess->srate_rx / 1000;
+		hdr->ts_arrive = tmr_jiffies() * sess->srate_rx / 1000;
 
-		source_calc_jitter(mbr->s, ts, (uint32_t)ts_arrive);
+		/*
+		 * Calculate jitter only when the timestamp is different than
+		 * last packet (see RTP FAQ
+		 * https://www.cs.columbia.edu/~hgs/rtp/faq.html#jitter).
+		 */
+		if (hdr->ts != mbr->s->last_rtp_ts)
+			rtp_source_calc_jitter(mbr->s, hdr->ts,
+					   (uint32_t)hdr->ts_arrive);
 	}
 
+	mbr->s->last_rtp_ts = hdr->ts;
 	mbr->s->rtp_rx_bytes += payload_size;
+out:
+	mtx_unlock(sess->lock);
 }
 
 
@@ -597,17 +645,19 @@ int rtcp_stats(struct rtp_sock *rs, uint32_t ssrc, struct rtcp_stats *stats)
 {
 	const struct rtcp_sess *sess = rtp_rtcp_sess(rs);
 	struct rtp_member *mbr;
+	int err = 0;
 
 	if (!sess || !stats)
 		return EINVAL;
 
-	mbr = member_find(sess->members, ssrc);
-	if (!mbr)
-		return ENOENT;
-
 	mtx_lock(sess->lock);
+	mbr = member_find(sess->members, ssrc);
+	if (!mbr) {
+		err = ENOENT;
+		goto out;
+	}
+
 	stats->tx.sent = sess->txstat.psent;
-	mtx_unlock(sess->lock);
 
 	stats->tx.lost = mbr->cum_lost;
 	stats->tx.jit  = mbr->jit;
@@ -616,32 +666,34 @@ int rtcp_stats(struct rtp_sock *rs, uint32_t ssrc, struct rtcp_stats *stats)
 
 	if (!mbr->s) {
 		memset(&stats->rx, 0, sizeof(stats->rx));
-		return 0;
+		goto out;
 	}
 
 	stats->rx.sent = mbr->s->received;
-	stats->rx.lost = source_calc_lost(mbr->s);
+	stats->rx.lost = rtp_source_calc_lost(mbr->s);
 	stats->rx.jit  = sess->srate_rx ?
 		1000000 * (mbr->s->jitter>>4) / sess->srate_rx : 0;
 
-	return 0;
+out:
+	mtx_unlock(sess->lock);
+	return err;
 }
 
 
 static bool debug_handler(struct le *le, void *arg)
 {
 	const struct rtp_member *mbr = le->data;
-	struct re_printf *pf = arg;
+	struct mbuf *mb = arg;
 	int err;
 
-	err = re_hprintf(pf, "  member 0x%08x: lost=%d Jitter=%.1fms"
+	err = mbuf_printf(mb, "  member 0x%08x: lost=%d Jitter=%.1fms"
 			  " RTT=%.1fms\n", mbr->src, mbr->cum_lost,
 			  (double)mbr->jit/1000, (double)mbr->rtt/1000);
 	if (mbr->s) {
-		err |= re_hprintf(pf,
-				  "                 IP=%J psent=%u rcvd=%u\n",
-				  &mbr->s->rtp_peer, mbr->s->psent,
-				  mbr->s->received);
+		err |= mbuf_printf(mb,
+				   "                 IP=%J psent=%u rcvd=%u\n",
+				   &mbr->s->rtp_peer, mbr->s->psent,
+				   mbr->s->received);
 	}
 
 	return err != 0;
@@ -659,23 +711,35 @@ static bool debug_handler(struct le *le, void *arg)
 int rtcp_debug(struct re_printf *pf, const struct rtp_sock *rs)
 {
 	const struct rtcp_sess *sess = rtp_rtcp_sess(rs);
+	struct mbuf *mb;
 	int err = 0;
 
 	if (!sess)
 		return 0;
 
-	err |= re_hprintf(pf, "----- RTCP Session: -----\n");
-	err |= re_hprintf(pf, "  cname=%s SSRC=0x%08x/%u rx=%uHz\n",
+	mb = mbuf_alloc(64);
+	if (!mb)
+		return ENOMEM;
+
+	err |= mbuf_printf(mb, "----- RTCP Session: -----\n");
+	mtx_lock(sess->lock);
+	err |= mbuf_printf(mb, "  cname=%s SSRC=0x%08x/%u rx=%uHz\n",
 			  sess->cname,
 			  rtp_sess_ssrc(sess->rs), rtp_sess_ssrc(sess->rs),
 			  sess->srate_rx);
 
-	hash_apply(sess->members, debug_handler, pf);
+	hash_apply(sess->members, debug_handler, mb);
 
-	mtx_lock(sess->lock);
-	err |= re_hprintf(pf, "  TX: packets=%u, octets=%u\n",
+	err |= mbuf_printf(mb, "  TX: packets=%u, octets=%u\n",
 			  sess->txstat.psent, sess->txstat.osent);
 	mtx_unlock(sess->lock);
 
+	if (err)
+		goto out;
+
+	err = re_hprintf(pf, "%b", mb->buf, mb->pos);
+
+out:
+	mem_deref(mb);
 	return err;
 }

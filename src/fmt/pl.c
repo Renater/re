@@ -21,6 +21,48 @@
 const struct pl pl_null = {NULL, 0};
 
 
+static void pl_alloc_destruct(void *arg)
+{
+	struct pl *pl = arg;
+
+	mem_deref((void *)pl->p);
+}
+
+
+/**
+ * Allocate a pointer-length object from a NULL-terminated string
+ *
+ * @param str NULL-terminated string
+ *
+ * @return Allocated Pointer-length object or NULL
+ */
+struct pl *pl_alloc_str(const char *str)
+{
+	struct pl *pl;
+
+	if (!str)
+		return NULL;
+
+	size_t sz = strlen(str);
+
+	pl = mem_zalloc(sizeof(struct pl), pl_alloc_destruct);
+	if (!pl)
+		return NULL;
+
+	pl->p = mem_alloc(sz, NULL);
+	if (!pl->p) {
+		mem_deref(pl);
+		return NULL;
+	}
+
+	memcpy((void *)pl->p, str, sz);
+
+	pl->l = sz;
+
+	return pl;
+}
+
+
 /**
  * Initialise a pointer-length object from a NULL-terminated string
  *
@@ -337,14 +379,14 @@ int pl_bool(bool *val, const struct pl *pl)
 	if (!val || !pl)
 		return EINVAL;
 
-	for (i = 0; i < ARRAY_SIZE(tval); ++i) {
+	for (i = 0; i < RE_ARRAY_SIZE(tval); ++i) {
 		if (!pl_strcasecmp(pl, tval[i])) {
 			*val = true;
 			err = 0;
 		}
 	}
 
-	for (i = 0; i < ARRAY_SIZE(fval); ++i) {
+	for (i = 0; i < RE_ARRAY_SIZE(fval); ++i) {
 		if (!pl_strcasecmp(pl, fval[i])) {
 			*val = false;
 			err = 0;
@@ -352,6 +394,29 @@ int pl_bool(bool *val, const struct pl *pl)
 	}
 
 	return err;
+}
+
+
+/**
+ * Convert an ASCII hex string as a pointer-length object to binary format
+ *
+ * @param pl  Pointer-length object
+ * @param hex Destination binary buffer
+ * @param len Length of binary buffer
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int pl_hex(const struct pl *pl, uint8_t *hex, size_t len)
+{
+	if (!pl_isset(pl) || !hex || (pl->l != (2 * len)))
+		return EINVAL;
+
+	for (size_t i = 0; i < pl->l; i += 2) {
+		hex[i/2]  = ch_hex(*(pl->p + i)) << 4;
+		hex[i/2] += ch_hex(*(pl->p + i +1));
+	}
+
+	return 0;
 }
 
 
@@ -468,6 +533,28 @@ int pl_strcmp(const struct pl *pl, const char *str)
 	pl_set_str(&s, str);
 
 	return pl_cmp(pl, &s);
+}
+
+
+/**
+ * Compare n characters of a pointer-length object with a NULL-terminated
+ * string (case-sensitive)
+ *
+ * @param pl  Pointer-length object
+ * @param str NULL-terminated string
+ * @param n   number of characters that should be compared
+ *
+ * @return 0 if match, otherwise errorcode
+ */
+int pl_strncmp(const struct pl *pl, const char *str, size_t n)
+{
+	if (!pl_isset(pl) || !str || !n)
+		return EINVAL;
+
+	if (pl->l < n)
+		return EINVAL;
+
+	return strncmp(pl->p, str, n) == 0 ? 0 : EINVAL;
 }
 
 
@@ -649,6 +736,39 @@ const char *pl_strrchr(const struct pl *pl, char c)
 	for (p = end; p >= pl->p; p--) {
 		if (*p == c)
 			return p;
+	}
+
+	return NULL;
+}
+
+
+/**
+ * Locate the first substring in a pointer-length string
+ *
+ * @param pl  Pointer-length string
+ * @param str Substring to locate
+ *
+ * @return Pointer to first char if substring is found, otherwise NULL
+ */
+const char *pl_strstr(const struct pl *pl, const char *str)
+{
+	size_t len = str_len(str);
+
+	/*case pl not set & pl is not long enough*/
+	if (!pl_isset(pl) || pl->l < len)
+		return NULL;
+
+	/*case str is empty or just '\0'*/
+	if (!len)
+		return pl->p;
+
+	for (size_t i = 0; i < pl->l; ++i) {
+		/*case rest of pl is not long enough*/
+		if (pl->l - i < len)
+			return NULL;
+
+		if (!memcmp(pl->p + i, str, len))
+			return pl->p + i;
 	}
 
 	return NULL;

@@ -2,9 +2,6 @@
  * @file trace.c RE_TRACE helpers
  * JSON traces (chrome://tracing)
  */
-#define _DEFAULT_SOURCE 1
-#define _GNU_SOURCE 1
-
 #include <re_types.h>
 #include <re_mem.h>
 #include <re_trace.h>
@@ -12,7 +9,9 @@
 #include <re_list.h>
 #include <re_tmr.h>
 #include <re_thread.h>
+#include <re_atomic.h>
 #include <re_sys.h>
+#include <re_main.h>
 
 #ifdef HAVE_PTHREAD
 #include <pthread.h>
@@ -30,12 +29,29 @@
 #include <unistd.h>
 #endif
 
-#define TRACE_BUFFER_SIZE 1000000
+#define DEBUG_MODULE "trace"
+#define DEBUG_LEVEL 5
+#include <re_dbg.h>
+
+#ifndef TRACE_BUFFER_SIZE
+#define TRACE_BUFFER_SIZE 100000
+#endif
+
+#ifndef TRACE_FLUSH_THRESHOLD
+#define TRACE_FLUSH_THRESHOLD 1000
+#endif
+
+#ifndef TRACE_FLUSH_TMR
+#define TRACE_FLUSH_TMR 1000
+#endif
+
+
+#ifdef RE_TRACE_ENABLED
 
 struct trace_event {
 	const char *name;
 	const char *cat;
-	void *id;
+	struct pl *id;
 	uint64_t ts;
 	int pid;
 	unsigned long tid;
@@ -50,14 +66,16 @@ struct trace_event {
 
 /** Trace configuration */
 static struct {
+	RE_ATOMIC bool init;
 	int process_id;
 	FILE *f;
 	int event_count;
 	struct trace_event *event_buffer;
 	struct trace_event *event_buffer_flush;
 	mtx_t lock;
-	bool init;
+	bool new;
 	uint64_t start_time;
+	struct tmr flush_tmr;
 } trace = {
 	.init = false
 };
@@ -92,16 +110,51 @@ static inline int get_process_id(void)
 }
 
 
+static int flush_worker(void *arg)
+{
+	(void)arg;
+
+	mtx_lock(&trace.lock);
+	if (trace.event_count < TRACE_FLUSH_THRESHOLD) {
+		mtx_unlock(&trace.lock);
+		return 0;
+	}
+	mtx_unlock(&trace.lock);
+
+	re_trace_flush();
+
+	return 0;
+}
+
+
+static void flush_tmr(void *arg)
+{
+	(void)arg;
+
+	re_thread_async(flush_worker, NULL, NULL);
+
+	tmr_start(&trace.flush_tmr, TRACE_FLUSH_TMR, flush_tmr, NULL);
+}
+#endif
+
+
+/**
+ * Init new trace json file
+ *
+ * @param json_file  json file for trace events
+ *
+ * @return 0 if success, otherwise errorcode
+ */
 int re_trace_init(const char *json_file)
 {
+#ifdef RE_TRACE_ENABLED
 	int err = 0;
-
-#ifndef RE_TRACE_ENABLED
-	return 0;
-#endif
 
 	if (!json_file)
 		return EINVAL;
+
+	if (re_atomic_rlx(&trace.init))
+		return EALREADY;
 
 	trace.event_buffer = mem_zalloc(
 		TRACE_BUFFER_SIZE * sizeof(struct trace_event), NULL);
@@ -111,7 +164,7 @@ int re_trace_init(const char *json_file)
 	trace.event_buffer_flush = mem_zalloc(
 		TRACE_BUFFER_SIZE * sizeof(struct trace_event), NULL);
 	if (!trace.event_buffer_flush) {
-		mem_deref(trace.event_buffer);
+		trace.event_buffer = mem_deref(trace.event_buffer);
 		return ENOMEM;
 	}
 
@@ -129,33 +182,44 @@ int re_trace_init(const char *json_file)
 	(void)fflush(trace.f);
 
 	trace.start_time = tmr_jiffies_usec();
-	trace.init = true;
+	re_atomic_rlx_set(&trace.init, true);
+	trace.new = true;
+
+	tmr_init(&trace.flush_tmr);
+	tmr_start(&trace.flush_tmr, TRACE_FLUSH_TMR, flush_tmr, NULL);
 
 out:
 	if (err) {
-		trace.init = false;
-		mem_deref(trace.event_buffer);
-		mem_deref(trace.event_buffer_flush);
+		re_atomic_rlx_set(&trace.init, false);
+		trace.event_buffer	 = mem_deref(trace.event_buffer);
+		trace.event_buffer_flush = mem_deref(trace.event_buffer_flush);
 	}
 
 	return err;
+#else
+	(void)json_file;
+	return 0;
+#endif
 }
 
 
+/**
+ * Close and flush trace file
+ *
+ * @return 0 if success, otherwise errorcode
+ */
 int re_trace_close(void)
 {
+#ifdef RE_TRACE_ENABLED
 	int err = 0;
 
-#ifndef RE_TRACE_ENABLED
-	return 0;
-#endif
-
+	tmr_cancel(&trace.flush_tmr);
 	re_trace_flush();
+	re_atomic_rlx_set(&trace.init, false);
 
 	trace.event_buffer = mem_deref(trace.event_buffer);
 	trace.event_buffer_flush = mem_deref(trace.event_buffer_flush);
 	mtx_destroy(&trace.lock);
-	trace.init = false;
 
 	(void)re_fprintf(trace.f, "\n\t]\n}\n");
 	if (trace.f)
@@ -167,23 +231,28 @@ int re_trace_close(void)
 	trace.f = NULL;
 
 	return 0;
+#else
+	return 0;
+#endif
 }
 
 
+/**
+ * Flush trace buffer (can be called multiple times)
+ *
+ * @return 0 if success, otherwise errorcode
+ */
 int re_trace_flush(void)
 {
-	int i, flush_count;
+#ifdef RE_TRACE_ENABLED
+	int flush_count;
 	struct trace_event *event_tmp;
 	struct trace_event *e;
-	char json_arg[256];
-	char name[128];
-	static bool first = true;
+	char *json_arg;
+	char name[128]	 = {0};
+	char id_str[128] = {0};
 
-#ifndef RE_TRACE_ENABLED
-	return 0;
-#endif
-
-	if (!trace.init)
+	if (!re_atomic_rlx(&trace.init))
 		return 0;
 
 	mtx_lock(&trace.lock);
@@ -195,7 +264,21 @@ int re_trace_flush(void)
 	trace.event_count = 0;
 	mtx_unlock(&trace.lock);
 
-	for (i = 0; i < flush_count; i++)
+	size_t json_arg_sz = 4096;
+	json_arg = mem_zalloc(json_arg_sz, NULL);
+	if (!json_arg) {
+		for (int i = 0; i < flush_count; i++) {
+			e = &trace.event_buffer_flush[i];
+			if (e->arg_type == RE_TRACE_ARG_STRING_COPY)
+				mem_deref((void *)e->arg.a_str);
+
+			if (e->id)
+				mem_deref(e->id);
+		}
+		return ENOMEM;
+	}
+
+	for (int i = 0; i < flush_count; i++)
 	{
 		e = &trace.event_buffer_flush[i];
 
@@ -204,17 +287,17 @@ int re_trace_flush(void)
 			json_arg[0] = '\0';
 			break;
 		case RE_TRACE_ARG_INT:
-			(void)re_snprintf(json_arg, sizeof(json_arg),
+			(void)re_snprintf(json_arg, json_arg_sz,
 					", \"args\":{\"%s\":%i}",
 					e->arg_name, e->arg.a_int);
 			break;
 		case RE_TRACE_ARG_STRING_CONST:
-			(void)re_snprintf(json_arg, sizeof(json_arg),
+			(void)re_snprintf(json_arg, json_arg_sz,
 					", \"args\":{\"%s\":\"%s\"}",
 					e->arg_name, e->arg.a_str);
 			break;
 		case RE_TRACE_ARG_STRING_COPY:
-			(void)re_snprintf(json_arg, sizeof(json_arg),
+			(void)re_snprintf(json_arg, json_arg_sz,
 					", \"args\":{\"%s\":\"%s\"}",
 					e->arg_name, e->arg.a_str);
 
@@ -224,35 +307,46 @@ int re_trace_flush(void)
 
 		re_snprintf(name, sizeof(name), "\"name\":\"%s\"", e->name);
 
+		if (e->id) {
+			re_snprintf(id_str, sizeof(id_str), ", \"id\":\"%r\"",
+				    e->id);
+			mem_deref(e->id);
+		}
+
 		(void)re_fprintf(trace.f,
-			"%s{\"cat\":\"%s\",\"pid\":%i,\"tid\":%lu,\"ts\":%llu,"
-			"\"ph\":\"%c\",%s%s}",
-			first ? "" : ",\n",
+			"%s{\"cat\":\"%s\",\"pid\":%i,\"tid\":%lu,\"ts\":%Lu,"
+			"\"ph\":\"%c\",%s%s%s}",
+			trace.new ? "" : ",\n",
 			e->cat, e->pid, e->tid, e->ts - trace.start_time,
-			e->ph, name, str_isset(json_arg) ? json_arg : "");
-		first = false;
+			e->ph, name,
+			e->id ? id_str : "",
+			str_isset(json_arg) ? json_arg : "");
+		trace.new = false;
 	}
+
+	mem_deref(json_arg);
 
 	(void)fflush(trace.f);
 	return 0;
+#else
+	return 0;
+#endif
 }
 
 
-void re_trace_event(const char *cat, const char *name, char ph, void *id,
-                    int32_t custom_id, re_trace_arg_type arg_type,
-                    const char *arg_name, void *arg_value)
+void re_trace_event(const char *cat, const char *name, char ph, struct pl *id,
+		    re_trace_arg_type arg_type, const char *arg_name,
+		    void *arg_value)
 {
+#ifdef RE_TRACE_ENABLED
 	struct trace_event *e;
 
-#ifndef RE_TRACE_ENABLED
-	return;
-#endif
-
-	if (!trace.init)
+	if (!re_atomic_rlx(&trace.init))
 		return;
 
 	mtx_lock(&trace.lock);
 	if (trace.event_count >= TRACE_BUFFER_SIZE) {
+		DEBUG_WARNING("Increase TRACE_BUFFER_SIZE\n");
 		mtx_unlock(&trace.lock);
 		return;
 	}
@@ -261,17 +355,12 @@ void re_trace_event(const char *cat, const char *name, char ph, void *id,
 	mtx_unlock(&trace.lock);
 
 	e->ts = tmr_jiffies_usec();
-	e->id = id;
+	e->id = mem_ref(id);
 	e->ph = ph;
 	e->cat = cat;
 	e->name = name;
 	e->pid = get_process_id();
-	if (custom_id) {
-		e->tid = custom_id;
-	}
-	else {
-		e->tid = get_thread_id();
-	}
+	e->tid = get_thread_id();
 	e->arg_type = arg_type;
 	e->arg_name = arg_name;
 
@@ -289,4 +378,13 @@ void re_trace_event(const char *cat, const char *name, char ph, void *id,
 			(const char *)arg_value);
 		break;
 	}
+#else
+	(void)cat;
+	(void)name;
+	(void)ph;
+	(void)id;
+	(void)arg_type;
+	(void)arg_name;
+	(void)arg_value;
+#endif
 }

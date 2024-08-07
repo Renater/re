@@ -82,7 +82,7 @@ static void rtcp_destructor(void *data)
  * Encode the RTCP Header
  *
  * @param mb     Buffer to encode into
- * @param count  Number of sub-elemements
+ * @param count  Number of sub-elements
  * @param type   RTCP Packet type
  * @param length Packet length in words
  *
@@ -257,6 +257,51 @@ int rtcp_vencode(struct mbuf *mb, enum rtcp_type type, uint32_t count,
  * @param mb    Buffer to encode into
  * @param type  RTCP Packet type
  * @param count Packet-specific count
+ * @param ...   Variable arguments, type specific
+ *
+ * Variable arguments for each RTCP type:
+ *
+ * \verbatim
+  SR       SSRC of sender
+           NTP Timestamp (MSW)
+           NTP Timestamp (LSW)
+           RTP Timestamp
+           Sender packet count
+           Sender octet count
+           Encode handler for report block
+           Handler argument
+
+  RR       SSRC of sender
+           Encode handler for report block
+           Handler argument
+
+  SDES     Encode handler for SDES chunk
+           Handler argument
+
+  BYE      SSRCs (vector)
+           Reason string (optional)
+
+  APP      SSRC/CSRC
+           name (ASCII)
+           Data
+           Data length
+
+  FIR      SSRC
+
+  NACK     SSRC
+           FSN
+           BLP
+
+  RTPFB    SSRC packet
+           SSRC media
+           Encode handler
+           Handler argument
+
+  PSFB     SSRC packet
+           SSRC media
+           Encode handler
+           Handler argument
+   \endverbatim
  *
  * @return 0 for success, otherwise errorcode
  */

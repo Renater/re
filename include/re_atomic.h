@@ -526,7 +526,7 @@ static __forceinline void _re_atomic_store(
 }
 
 static __forceinline unsigned __int64 _re_atomic_load(
-	size_t size, void *a)
+	size_t size, const void *a, unsigned int mo)
 {
 	unsigned __int64 v;
 	assert(size == 1u || size == 2u || size == 4u || size == 8u);
@@ -591,7 +591,7 @@ static __forceinline void _re_atomic_store(
 }
 
 static __forceinline unsigned __int64 _re_atomic_load(
-	size_t size, void *a)
+	size_t size, const void *a, unsigned int mo)
 {
 	unsigned __int64 v;
 	assert(size == 1u || size == 2u || size == 4u || size == 8u);
@@ -608,7 +608,7 @@ static __forceinline unsigned __int64 _re_atomic_load(
 		v = __iso_volatile_load32((const unsigned __int32*)a);
 		break;
 	default:
-		v = __iso_volatile_load64(*(const unsigned __int64*)a);
+		v = __iso_volatile_load64((const unsigned __int64*)a);
 		break;
 	}
 
@@ -625,7 +625,7 @@ static __forceinline unsigned __int64 _re_atomic_load(
 #else
 
 static __forceinline void _re_atomic_store(
-	size_t size, void *a, unsigned __int64 v)
+	size_t size, void *a, unsigned __int64 v, unsigned int mo)
 {
 	assert(size == 1u || size == 2u || size == 4u || size == 8u);
 	_ReadWriteBarrier();
@@ -695,7 +695,7 @@ static __forceinline void _re_atomic_store(
 }
 
 static __forceinline unsigned __int64 _re_atomic_load(
-	size_t size, void *a)
+	size_t size, const void *a, unsigned int mo)
 {
 	unsigned __int64 v;
 	assert(size == 1u || size == 2u || size == 4u || size == 8u);
@@ -723,7 +723,7 @@ static __forceinline unsigned __int64 _re_atomic_load(
 	_re_atomic_store(sizeof(*(_a)), _a, _v, _mo);
 
 #define re_atomic_load(_a, _mo) \
-	_re_atomic_load(sizeof(*(_a)), _a)
+	_re_atomic_load(sizeof(*(_a)), _a, _mo)
 
 static __forceinline unsigned __int64 _re_atomic_exchange(
 	size_t size, void *a, unsigned __int64 v)
@@ -1077,7 +1077,7 @@ static __forceinline unsigned __int64 _re_atomic_fetch_and(
 /**
  * @def re_atomic_rlx_sub(_a, _v)
  *
- * Replace value from an atomic object with substraction and relaxed order
+ * Replace value from an atomic object with subtraction and relaxed order
  *
  * @param _a  pointer to the atomic object
  * @param _v  value to subtract
@@ -1129,7 +1129,7 @@ static __forceinline unsigned __int64 _re_atomic_fetch_and(
 /**
  * @def re_atomic_acq_sub(_a, _v)
  *
- * Replace value from an atomic object with substraction and acquire-release
+ * Replace value from an atomic object with subtraction and acquire-release
  * order
  *
  * @param _a  pointer to the atomic object
@@ -1183,11 +1183,11 @@ static __forceinline unsigned __int64 _re_atomic_fetch_and(
 /**
  * @def re_atomic_seq_sub(_a, _v)
  *
- * Replace value from an atomic object with substraction and
+ * Replace value from an atomic object with subtraction and
  * sequentially-consistent order
  *
  * @param _a  pointer to the atomic object
- * @param _v  value to substract
+ * @param _v  value to subtract
  *
  * @return value held previously by the atomic variable
  */

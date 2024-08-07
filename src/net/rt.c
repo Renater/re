@@ -3,8 +3,6 @@
  *
  * Copyright (C) 2010 Creytiv.com
  */
-#define _BSD_SOURCE 1
-#define _DEFAULT_SOURCE 1
 #include <re_types.h>
 #include <re_fmt.h>
 #include <re_mbuf.h>
@@ -33,7 +31,6 @@ static bool rt_debug_handler(const char *ifname, const struct sa *dst,
 	err |= re_hprintf(pf, "%-40j", gw);
 	err |= re_hprintf(pf, " %-15s ", ifname);
 
-#ifdef HAVE_INET6
 	if (AF_INET6 == sa_af(dst)) {
 		const struct sockaddr_in6 *sin6 = &dst->u.in6;
 		const struct in6_addr *in6 = &sin6->sin6_addr;
@@ -45,7 +42,6 @@ static bool rt_debug_handler(const char *ifname, const struct sa *dst,
 		if (IN6_IS_ADDR_SITELOCAL(in6))
 			err |= re_hprintf(pf, " SITELOCAL");
 	}
-#endif
 
 	err |= re_hprintf(pf, "\n");
 
@@ -100,7 +96,6 @@ static bool rt_default_get_handler(const char *_ifname, const struct sa *dst,
 		}
 		break;
 
-#ifdef HAVE_INET6
 	case AF_INET6:
 		if (IN6_IS_ADDR_MULTICAST(&dst->u.in6.sin6_addr))
 			return false;
@@ -113,7 +108,6 @@ static bool rt_default_get_handler(const char *_ifname, const struct sa *dst,
 			return false;
 		}
 		break;
-#endif
 	}
 
 	return false;

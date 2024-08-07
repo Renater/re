@@ -11,6 +11,7 @@
 
 #include <string.h>
 #include <re_types.h>
+#include <re_sys.h>
 #include <re_mem.h>
 #include <re_mbuf.h>
 #include <re_sa.h>
@@ -30,10 +31,6 @@
 #define DEBUG_MODULE "reqconn"
 #define DEBUG_LEVEL 5
 #include <re_dbg.h>
-
-#ifndef VERSION
-#define VERSION "???"
-#endif
 
 
 enum {
@@ -238,6 +235,7 @@ static void resp_handler(int err, const struct http_msg *msg, void *arg)
 	}
 
 	pl_set_mbuf(&auth, abuf);
+	mbuf_set_pos(conn->body, 0);
 	err = send_req(conn, &auth);
 	if (err)
 		goto disconnect;
@@ -319,7 +317,7 @@ static int send_req(struct http_reqconn *conn, const struct pl *auth)
 			mbuf_printf(clbuf, "Content-Length: %llu\r\n",
 				    conn->bodyl);
 		else
-			mbuf_printf(clbuf, "Content-Length: %lu\r\n",
+			mbuf_printf(clbuf, "Content-Length: %zu\r\n",
 				    mbuf_get_left(conn->body));
 
 		mbuf_set_pos(clbuf, 0);
@@ -333,7 +331,7 @@ static int send_req(struct http_reqconn *conn, const struct pl *auth)
 		pl_set_mbuf(&ct, ctbuf);
 	}
 
-	DEBUG_INFO("send %s uri=%s path=%s len=%lu %s auth.\n",
+	DEBUG_INFO("send %s uri=%s path=%s len=%zu %s auth.\n",
 			conn->met, conn->uri, conn->path,
 			mbuf_get_left(conn->body),
 			auth ? "with" : "without");
@@ -358,7 +356,7 @@ static int send_req(struct http_reqconn *conn, const struct pl *auth)
 			(conn->bodyh || conn->body) ? req_body_handler : NULL,
 			conn,
 			"%r%s"
-			"User-Agent: re " VERSION "\r\n"
+			"User-Agent: re " RE_VERSION "\r\n"
 			"%r"
 			"%r"
 			"%r"

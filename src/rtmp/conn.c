@@ -723,7 +723,7 @@ static bool rr_handler(struct dnsrr *rr, void *arg)
 {
 	struct rtmp_conn *conn = arg;
 
-	if (conn->srvc >= ARRAY_SIZE(conn->srvv))
+	if (conn->srvc >= RE_ARRAY_SIZE(conn->srvv))
 		return true;
 
 	switch (rr->type) {
@@ -869,9 +869,7 @@ int rtmp_connect(struct rtmp_conn **connp, struct dnsc *dnsc, const char *uri,
 			goto out;
 	}
 	else {
-#ifdef HAVE_INET6
 		struct sa tmp;
-#endif
 
 		if (!dnsc) {
 			err = EINVAL;
@@ -885,7 +883,6 @@ int rtmp_connect(struct rtmp_conn **connp, struct dnsc *dnsc, const char *uri,
 		if (err)
 			goto out;
 
-#ifdef HAVE_INET6
 		if (0 == net_default_source_addr_get(AF_INET6, &tmp)) {
 
 			err = dnsc_query(&conn->dnsq6, dnsc, conn->host,
@@ -894,7 +891,6 @@ int rtmp_connect(struct rtmp_conn **connp, struct dnsc *dnsc, const char *uri,
 			if (err)
 				goto out;
 		}
-#endif
 	}
 
  out:

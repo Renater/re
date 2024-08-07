@@ -47,6 +47,12 @@ struct sip_ccert {
 };
 
 
+struct sip_ccert_data {
+	uint32_t hsup;
+	struct sip_ccert *ccert;
+};
+
+
 struct sip_transport {
 	struct le le;
 	struct sa laddr;
@@ -191,6 +197,31 @@ static const struct sip_transport *transp_find(struct sip *sip,
 }
 
 
+static struct le *transp_apply_all(struct sip *sip, enum sip_transp tp, int af,
+				   list_apply_h ah, void *arg)
+{
+	if (!ah)
+		return NULL;
+
+	for (struct le *le = sip->transpl.head; le; le = le->next) {
+
+		const struct sip_transport *transp = le->data;
+		const struct sa *laddr = &transp->laddr;
+
+		if (transp->tp != tp)
+			continue;
+
+		if (af != AF_UNSPEC && sa_af(laddr) != af)
+			continue;
+
+		if (ah(le, arg))
+			return le;
+	}
+
+	return NULL;
+}
+
+
 static struct sip_conn *conn_find(struct sip *sip, const struct sa *paddr,
 				  bool secure)
 {
@@ -261,15 +292,14 @@ static void conn_close(struct sip_conn *conn, int err)
 
 		struct sip_connqent *qent = le->data;
 		le = le->next;
-
-		if (qent->qentp) {
-			*qent->qentp = NULL;
-			qent->qentp = NULL;
-		}
+		bool qentp_set = qent->qentp ? true : false;
 
 		qent->transph(err, qent->arg);
-		list_unlink(&qent->le);
-		mem_deref(qent);
+
+		if (!qentp_set) {
+			list_unlink(&qent->le);
+			mem_deref(qent);
+		}
 	}
 
 	sip_keepalive_signal(&conn->kal, err);
@@ -315,7 +345,8 @@ static bool have_essential_fields(const struct sip_msg *msg)
 		pl_isset(&(msg->from.auri)) &&
 		pl_isset(&(msg->cseq.met)) &&
 		pl_isset(&(msg->callid)) &&
-		pl_isset(&(msg->maxfwd)) &&
+		(pl_isset(&(msg->maxfwd)) ||
+		 !pl_strncmp(&msg->met, "ACK", 3)) &&
 		pl_isset(&(msg->via.branch)))
 		return true;
 
@@ -359,7 +390,7 @@ static void sip_recv(struct sip *sip, const struct sip_msg *msg,
 	}
 
 	if (msg->req) {
-		(void)re_fprintf(stderr, "unhandeled request from %J: %r %r\n",
+		(void)re_fprintf(stderr, "unhandled request from %J: %r %r\n",
 				 &msg->src, &msg->met, &msg->ruri);
 
 		if (!pl_strcmp(&msg->met, "CANCEL"))
@@ -370,7 +401,7 @@ static void sip_recv(struct sip *sip, const struct sip_msg *msg,
 					501, "Not Implemented");
 	}
 	else {
-		(void)re_fprintf(stderr, "unhandeled response from %J:"
+		(void)re_fprintf(stderr, "unhandled response from %J:"
 				 " %u %r (%r)\n", &msg->src,
 				 msg->scode, &msg->reason, &msg->cseq.met);
 	}
@@ -618,12 +649,8 @@ static void tcp_estab_handler(void *arg)
 	while (le) {
 
 		struct sip_connqent *qent = le->data;
+		bool qentp_set = qent->qentp ? true : false;
 		le = le->next;
-
-		if (qent->qentp) {
-			*qent->qentp = NULL;
-			qent->qentp = NULL;
-		}
 
 		trace_send(conn->sip,
 			   conn->sc ? SIP_TRANSP_TLS : SIP_TRANSP_TCP,
@@ -634,8 +661,10 @@ static void tcp_estab_handler(void *arg)
 		if (err)
 			qent->transph(err, qent->arg);
 
-		list_unlink(&qent->le);
-		mem_deref(qent);
+		if (!qentp_set) {
+			list_unlink(&qent->le);
+			mem_deref(qent);
+		}
 	}
 }
 
@@ -680,6 +709,10 @@ static void tcp_connect_handler(const struct sa *paddr, void *arg)
 #ifdef USE_TLS
 	if (transp->tls) {
 		err = tls_start_tcp(&conn->sc, transp->tls, conn->tc, 0);
+		if (err)
+			goto out;
+
+		err = tls_verify_client(conn->sc);
 		if (err)
 			goto out;
 	}
@@ -734,7 +767,7 @@ static uint32_t get_hash_of_fromhdr(struct mbuf *mb)
 
 static int conn_send(struct sip_connqent **qentp, struct sip *sip, bool secure,
 		     const struct sa *dst, char *host, struct mbuf *mb,
-		     sip_transp_h *transph, void *arg)
+		     sip_conn_h *connh, sip_transp_h *transph, void *arg)
 {
 	struct sip_conn *conn, *new_conn = NULL;
 	struct sip_conncfg *conncfg;
@@ -747,6 +780,9 @@ static int conn_send(struct sip_connqent **qentp, struct sip *sip, bool secure,
 
 	conn = conn_find(sip, dst, secure);
 	if (conn) {
+		if (connh)
+			err = connh(&conn->laddr, dst, mb, arg);
+
 		if (!conn->established)
 			goto enqueue;
 
@@ -788,6 +824,23 @@ static int conn_send(struct sip_connqent **qentp, struct sip *sip, bool secure,
 	err = tcp_conn_local_get(conn->tc, &conn->laddr);
 	if (err)
 		goto out;
+
+	/* Fallback check for any address win32 */
+	if (!sa_isset(&conn->laddr, SA_ALL)) {
+		uint16_t port = sa_port(&conn->laddr);
+		err = sip_transp_laddr(sip, &conn->laddr, conn->tp, dst);
+		if (err)
+			goto out;
+
+		if (port)
+			sa_set_port(&conn->laddr, port);
+	}
+
+	if (connh) {
+		err = connh(&conn->laddr, dst, mb, arg);
+		if (err)
+			goto out;
+	}
 
 	(void)tcp_conn_settos(conn->tc, sip->tos);
 #ifdef USE_TLS
@@ -876,12 +929,8 @@ static void websock_estab_handler(void *arg)
 	while (le) {
 
 		struct sip_connqent *qent = le->data;
+		bool qentp_set = qent->qentp ? true : false;
 		le = le->next;
-
-		if (qent->qentp) {
-			*qent->qentp = NULL;
-			qent->qentp = NULL;
-		}
 
 		trace_send(conn->sip,
 			   conn->tp,
@@ -897,8 +946,10 @@ static void websock_estab_handler(void *arg)
 		if (err)
 			qent->transph(err, qent->arg);
 
-		list_unlink(&qent->le);
-		mem_deref(qent);
+		if (!qentp_set) {
+			list_unlink(&qent->le);
+			mem_deref(qent);
+		}
 	}
 }
 
@@ -925,6 +976,8 @@ static void websock_recv_handler(const struct websock_hdr *hdr,
 
 	if (mb->end <= 4)
 		return;
+
+	tmr_start(&conn->tmr, TCP_IDLE_TIMEOUT * 1000, conn_tmr_handler, conn);
 
 	start = mb->pos;
 
@@ -1080,7 +1133,6 @@ static int ws_conn_send(struct sip_connqent **qentp, struct sip *sip,
 }
 
 
-#if HAVE_INET6
 static int dst_set_scopeid(struct sip *sip, struct sa *dst, enum sip_transp tp)
 {
 	struct sa laddr;
@@ -1096,7 +1148,6 @@ static int dst_set_scopeid(struct sip *sip, struct sa *dst, enum sip_transp tp)
 	sa_set_scopeid(dst, sa_scopeid(&laddr));
 	return 0;
 }
-#endif
 
 
 int sip_transp_init(struct sip *sip, uint32_t sz)
@@ -1148,8 +1199,8 @@ static void http_req_handler(struct http_conn *hc, const struct http_msg *msg,
 	conn->sip   = transp->sip;
 	conn->tp    = transp->tp;
 
-	err = websock_accept(&conn->websock_conn, transp->sip->websock,
-			     hc, msg, 15000,
+	err = websock_accept_proto(&conn->websock_conn, "sip",
+                             transp->sip->websock, hc, msg, 15000,
                              websock_recv_handler, websock_close_handler,
                              conn);
 	if (err)
@@ -1159,9 +1210,6 @@ static void http_req_handler(struct http_conn *hc, const struct http_msg *msg,
 				 &conn->laddr);
 	if (err)
 		goto out;
-
-	tmr_start(&conn->tmr, TCP_ACCEPT_TIMEOUT * 1000,
-		  conn_tmr_handler, conn);
 
  out:
 	if (err) {
@@ -1174,19 +1222,19 @@ static void http_req_handler(struct http_conn *hc, const struct http_msg *msg,
 /**
  * Add a SIP transport
  *
- * @param sip   SIP stack instance
- * @param tp    SIP Transport
- * @param laddr Local network address
- * @param ...   Optional transport parameters such as TLS context
+ * @param sip    SIP stack instance
+ * @param tp     SIP Transport
+ * @param listen True to open listening socket (UDP socket always opened)
+ * @param laddr  Local network address
+ * @param ap     Optional transport parameters such as TLS context
  *
  * @return 0 if success, otherwise errorcode
  */
-int sip_transp_add(struct sip *sip, enum sip_transp tp,
-		   const struct sa *laddr, ...)
+static int add_transp(struct sip *sip, enum sip_transp tp,
+		      bool listen, const struct sa *laddr, va_list ap)
 {
 	struct sip_transport *transp;
 	struct tls *tls;
-	va_list ap;
 	int err = 0;
 
 	if (!sip || !laddr || !sa_isset(laddr, SA_ADDR))
@@ -1207,8 +1255,6 @@ int sip_transp_add(struct sip *sip, enum sip_transp tp,
 	list_append(&sip->transpl, &transp->le, transp);
 	transp->sip = sip;
 	transp->tp  = tp;
-
-	va_start(ap, laddr);
 
 	switch (tp) {
 
@@ -1233,6 +1279,13 @@ int sip_transp_add(struct sip *sip, enum sip_transp tp,
 		/*@fallthrough@*/
 
 	case SIP_TRANSP_TCP:
+
+		if (!listen) {
+			transp->laddr = *laddr;
+			sa_set_port(&transp->laddr, 0);
+			return err;
+		}
+
 		err = tcp_listen((struct tcp_sock **)&transp->sock, laddr,
 				 tcp_connect_handler, transp);
 		if (err)
@@ -1246,10 +1299,59 @@ int sip_transp_add(struct sip *sip, enum sip_transp tp,
 		break;
 	}
 
-	va_end(ap);
-
 	if (err)
 		mem_deref(transp);
+
+	return err;
+}
+
+
+/**
+ * Add a SIP transport
+ *
+ * @param sip   SIP stack instance
+ * @param tp    SIP Transport
+ * @param laddr Local network address
+ * @param ...   Optional transport parameters such as TLS context
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int sip_transp_add(struct sip *sip, enum sip_transp tp,
+		   const struct sa *laddr, ...)
+{
+	int err;
+	va_list ap;
+
+	va_start(ap, laddr);
+	err = add_transp(sip, tp, true, laddr, ap);
+	va_end(ap);
+
+	return err;
+}
+
+
+/**
+ * Add a SIP transport and open listening socket if requested
+ *
+ * UDP socket will always be opened even if listen is false.
+ *
+ * @param sip    SIP stack instance
+ * @param tp     SIP Transport
+ * @param listen True to open listening socket
+ * @param laddr  Local network address
+ * @param ...	 Optional transport parameters such as TLS context
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int sip_transp_add_sock(struct sip *sip, enum sip_transp tp,
+			bool listen, const struct sa *laddr, ...)
+{
+	int err;
+	va_list ap;
+
+	va_start(ap, laddr);
+	err = add_transp(sip, tp, listen, laddr, ap);
+	va_end(ap);
 
 	return err;
 }
@@ -1330,6 +1432,27 @@ int sip_transp_add_websock(struct sip *sip, enum sip_transp tp,
 }
 
 
+static bool add_ccert_handler(struct le *le, void *arg)
+{
+	const struct sip_transport *transp = le->data;
+	struct sip_ccert_data *cc = arg;
+
+	if (!cc->ccert->he.list)
+		hash_append(transp->ht_ccert, cc->hsup, &cc->ccert->he,
+			    cc->ccert);
+	else {
+		struct sip_ccert *ccert = mem_zalloc(sizeof(*ccert), NULL);
+		if (!ccert)
+			return false;
+
+		ccert->file = cc->ccert->file;
+		hash_append(transp->ht_ccert, cc->hsup, &ccert->he, ccert);
+	}
+
+	return false;
+}
+
+
 /**
  * Add a client certificate to the TLS transport object
  * Client certificates are saved as hash-table.
@@ -1345,10 +1468,9 @@ int sip_transp_add_ccert(struct sip *sip, const struct uri *uri,
 			 const char *cert)
 {
 	int err = 0;
-	const struct sip_transport *transp = NULL;
 	struct sip_ccert *ccert = NULL;
+	struct sip_ccert_data cc_data;
 	struct mbuf *sup = NULL;
-	uint32_t hsup = 0;
 
 	if (!sip || !uri || !cert)
 		return EINVAL;
@@ -1364,30 +1486,20 @@ int sip_transp_add_ccert(struct sip *sip, const struct uri *uri,
 
 	mbuf_set_pos(sup, 0);
 
-	hsup = hash_joaat(mbuf_buf(sup), mbuf_get_left(sup));
-	transp = transp_find(sip, SIP_TRANSP_TLS, AF_INET, NULL);
-	if (transp) {
-		ccert = mem_zalloc(sizeof(*ccert), NULL);
-		if (!ccert) {
-			err = ENOMEM;
-			goto out;
-		}
-
-		pl_set_str(&ccert->file, cert);
-		hash_append(transp->ht_ccert, hsup, &ccert->he, ccert);
+	ccert = mem_zalloc(sizeof(*ccert), NULL);
+	if (!ccert) {
+		err = ENOMEM;
+		goto out;
 	}
+	pl_set_str(&ccert->file, cert);
 
-	transp = transp_find(sip, SIP_TRANSP_TLS, AF_INET6, NULL);
-	if (transp) {
-		ccert = mem_zalloc(sizeof(*ccert), NULL);
-		if (!ccert) {
-			err = ENOMEM;
-			goto out;
-		}
+	cc_data.hsup = hash_joaat(mbuf_buf(sup), mbuf_get_left(sup));
+	cc_data.ccert = ccert;
 
-		pl_set_str(&ccert->file, cert);
-		hash_append(transp->ht_ccert, hsup, &ccert->he, ccert);
-	}
+	(void)transp_apply_all(sip, SIP_TRANSP_TLS, AF_INET, add_ccert_handler,
+			       &cc_data);
+	(void)transp_apply_all(sip, SIP_TRANSP_TLS, AF_INET6,
+			       add_ccert_handler, &cc_data);
 
  out:
 	mem_deref(sup);
@@ -1413,27 +1525,34 @@ void sip_transp_flush(struct sip *sip)
 
 int sip_transp_send(struct sip_connqent **qentp, struct sip *sip, void *sock,
 		    enum sip_transp tp, const struct sa *dst, char *host,
-		    struct mbuf *mb, sip_transp_h *transph, void *arg)
+		    struct mbuf *mb, sip_conn_h *connh, sip_transp_h *transph,
+		    void *arg)
 {
 	const struct sip_transport *transp;
 	struct sip_conn *conn;
 	bool secure = false;
 	struct sa dsttmp;
+	struct sa laddr;
 	int err;
 
 	if (!sip || !dst || !mb)
 		return EINVAL;
 
 	sa_cpy(&dsttmp, dst);
-#if HAVE_INET6
 	err = dst_set_scopeid(sip, &dsttmp, tp);
 	if (err)
 		return err;
-#endif
 
 	switch (tp) {
 
 	case SIP_TRANSP_UDP:
+		err = sip_transp_laddr(sip, &laddr, tp, dst);
+		if (err)
+			return err;
+
+		if (connh)
+			connh(&laddr, dst, mb, arg);
+
 		if (!sock) {
 			transp = transp_find(sip, tp, sa_af(&dsttmp), &dsttmp);
 			if (!transp)
@@ -1455,6 +1574,11 @@ int sip_transp_send(struct sip_connqent **qentp, struct sip *sip, void *sock,
 		conn = sock;
 
 		if (conn && conn->tc) {
+			if (connh) {
+				err = connh(&conn->laddr, dst, mb, arg);
+				if (err)
+					return err;
+			}
 
 			trace_send(sip, tp, conn, &dsttmp, mb);
 
@@ -1462,7 +1586,7 @@ int sip_transp_send(struct sip_connqent **qentp, struct sip *sip, void *sock,
 		}
 		else
 			err = conn_send(qentp, sip, secure, &dsttmp, host, mb,
-					transph, arg);
+					connh, transph, arg);
 		break;
 
 	case SIP_TRANSP_WSS:
@@ -1470,6 +1594,16 @@ int sip_transp_send(struct sip_connqent **qentp, struct sip *sip, void *sock,
 		/*@fallthrough@*/
 
 	case SIP_TRANSP_WS:
+		/*TODO: Ideally connh should be called if the websocket was
+		 * opened and the source port is known. As a workaround the
+		 * listen port is used for Contact and Via headers */
+		err = sip_transp_laddr(sip, &laddr, tp, dst);
+		if (err)
+			return err;
+
+		if (connh)
+			connh(&laddr, dst, mb, arg);
+
 		conn = sock;
 		if (conn && conn->websock_conn) {
 
@@ -1725,10 +1859,29 @@ int  sip_settos(struct sip *sip, uint8_t tos)
 }
 
 
+static void sip_transports_print(struct re_printf *pf, const struct sip* sip)
+{
+	uint32_t mask = 0;
+
+	for (struct le *le = sip->transpl.head; le; le = le->next) {
+		const struct sip_transport *transp = le->data;
+		mask |= (1 << transp->tp);
+	}
+
+	for (uint8_t i = 0; i < SIP_TRANSPC; ++i) {
+		if (mask==0 || (0 != (mask & (1u << i))))
+			(void)re_hprintf(pf, "  %s\n", sip_transp_name(i));
+	}
+}
+
+
 static bool debug_handler(struct le *le, void *arg)
 {
 	const struct sip_transport *transp = le->data;
 	struct re_printf *pf = arg;
+
+	if (sa_port(&transp->laddr) == 0)
+		return false;
 
 	(void)re_hprintf(pf, "  %J (%s)\n",
 			 &transp->laddr,
@@ -1770,6 +1923,9 @@ int sip_transp_debug(struct re_printf *pf, const struct sip *sip)
 	int err;
 
 	err = re_hprintf(pf, "transports:\n");
+	sip_transports_print(pf, sip);
+
+	err |= re_hprintf(pf, "transport sockets:\n");
 	list_apply(&sip->transpl, true, debug_handler, pf);
 
 	err |= re_hprintf(pf, "connections:\n");

@@ -5,7 +5,7 @@ libre README
 libre is a Generic library for real-time communications with async IO support.
 
 - Copyright (C) 2010 - 2020 Creytiv.com
-- Copyright (C) 2020 - 2022 Baresip Foundation (https://github.com/baresip)
+- Copyright (C) 2020 - 2024 Baresip Foundation (https://github.com/baresip)
 
 ![Build](https://github.com/baresip/re/workflows/Build/badge.svg)
 ![ccheck](https://github.com/baresip/re/workflows/ccheck/badge.svg)
@@ -23,8 +23,7 @@ libre is a Generic library for real-time communications with async IO support.
 * BFCP
 * HTTP-stack with client/server
 * Websockets
-* Jitter-buffer
-* Async I/O (poll, epoll, select, kqueue)
+* Async I/O (select, epoll, kqueue)
 * UDP/TCP/TLS/DTLS transport
 * JSON parser
 * Real Time Messaging Protocol (RTMP)
@@ -32,7 +31,7 @@ libre is a Generic library for real-time communications with async IO support.
 
 ## Building
 
-libre is using GNU makefiles. Make and OpenSSL development headers must be
+libre is using CMake. CMake and OpenSSL development headers must be
 installed before building.
 
 
@@ -43,6 +42,13 @@ $ cmake -B build
 $ cmake --build build -j
 $ sudo cmake --install build
 $ sudo ldconfig
+```
+
+### Build/run tests
+
+```
+cmake -B build && cmake --build build -t retest -j
+build/test/retest -rv
 ```
 
 On some distributions, /usr/local/lib may not be included in ld.so.conf. 
@@ -77,7 +83,7 @@ $ sudo ldconfig
 ### Examples
 
 Coding examples are available from the
-[redemo](http://creytiv.com/pub/redemo-0.5.0.tar.gz) project
+[redemo](https://github.com/creytiv/redemo "creytiv/redemo: Demo example applications using libre") project.
 
 
 ## License
@@ -117,7 +123,6 @@ Patches can sent via Github
 | http     | stable   | HTTP parser (RFC 2616)                         |
 | httpauth | stable   | HTTP-based Authentication (RFC 2617)           |
 | ice      | stable   | Interactive Connectivity Establishment (ICE)   |
-| jbuf     | stable   | Jitter buffer                                  |
 | json     | stable   | JavaScript Object Notation (JSON)              |
 | list     | stable   | Sortable doubly-linked list handling           |
 | main     | stable   | Main poll loop                                 |
@@ -149,6 +154,7 @@ Patches can sent via Github
 | turn     | stable   | Obtaining Relay Addresses from STUN (TURN)     |
 | trace    | testing  | Trace Helpers JSON traces (chrome://tracing)   |
 | udp      | stable   | UDP transport                                  |
+| unixsock | testing  | Unix domain sockets                            |
 | uri      | stable   | Generic URI library                            |
 | websock  | stable   | WebSocket Client and Server                    |
 
@@ -163,7 +169,6 @@ legend:
 
 * [RFC 1321](https://tools.ietf.org/html/rfc1321) - The MD5 Message-Digest Algorithm
 * [RFC 1886](https://tools.ietf.org/html/rfc1886) - DNS Extensions to support IP version 6
-* [RFC 2032](https://tools.ietf.org/html/rfc2032) - RTP Payload Format for H.261 Video Streams
 * [RFC 2616](https://tools.ietf.org/html/rfc2616) - Hypertext Transfer Protocol -- HTTP/1.1
 * [RFC 2617](https://tools.ietf.org/html/rfc2617) - HTTP Authentication: Basic and Digest Access Authentication
 * [RFC 2782](https://tools.ietf.org/html/rfc2782) - A DNS RR for Specifying the Location of Services (DNS SRV)
@@ -187,15 +192,16 @@ legend:
 * [RFC 3711](https://tools.ietf.org/html/rfc3711) - The Secure Real-time Transport Protocol (SRTP)
 * [RFC 3969](https://tools.ietf.org/html/rfc3969) - The IANA URI Parameter Registry for SIP
 * [RFC 3994](https://tools.ietf.org/html/rfc3994) - Indication of Message Composition for Instant Messaging
-* [RFC 4346](https://tools.ietf.org/html/rfc4346) - The TLS Protocol Version 1.1
 * [RFC 4566](https://tools.ietf.org/html/rfc4566) - SDP: Session Description Protocol
 * [RFC 4582](https://tools.ietf.org/html/rfc4582) - The Binary Floor Control Protocol (BFCP)
 * [RFC 4582bis](https://tools.ietf.org/html/draft-ietf-bfcpbis-rfc4582bis-08) - The Binary Floor Control Protocol (BFCP)
 * [RFC 4585](https://tools.ietf.org/html/rfc4585) - Extended RTP Profile for RTCP-Based Feedback
 * [RFC 4733](https://tools.ietf.org/html/rfc4733) - RTP Payload for DTMF Digits, Telephony Tones, and Teleph. Signals
 * [RFC 4961](https://tools.ietf.org/html/rfc4961) - Symmetric RTP / RTP Control Protocol (RTCP)
+* [RFC 5104](https://tools.ietf.org/html/rfc5104) - Codec Control Messages in AVPF
 * [RFC 5118](https://tools.ietf.org/html/rfc5118) - SIP Torture Test Messages for IPv6
 * [RFC 5245](https://tools.ietf.org/html/rfc5245) - Interactive Connectivity Establishment (ICE)
+* [RFC 5246](https://tools.ietf.org/html/rfc5246) - The TLS Protocol Version 1.2
 * [RFC 5389](https://tools.ietf.org/html/rfc5389) - Session Traversal Utilities for NAT (STUN)
 * [RFC 5626](https://tools.ietf.org/html/rfc5626) - Managing Client-Initiated Connections in SIP
 * [RFC 5761](https://tools.ietf.org/html/rfc5761) - Multiplexing RTP Data and Control Packets on a Single Port
@@ -209,6 +215,7 @@ legend:
 * [RFC 6455](https://tools.ietf.org/html/rfc6455) - The WebSocket Protocol
 * [RFC 7159](https://tools.ietf.org/html/rfc7159) - JavaScript Object Notation (JSON)
 * [RFC 7350](https://tools.ietf.org/html/rfc7350) - DTLS as Transport for STUN
+* [RFC 7616](https://tools.ietf.org/html/rfc7616) - HTTP Digest Access Authentication
 * [RFC 7714](https://tools.ietf.org/html/rfc7714) - AES-GCM Authenticated Encryption in SRTP
 
 
@@ -216,13 +223,14 @@ legend:
 
 |  System | Support type | Supported versions | Notes |
 |---|---|---|---|
-| Linux | Tier 1 | glibc >= 2.27 (Ubuntu 18.04) | |
+| Linux | Tier 1 | glibc >= 2.27 | |
+| Linux | Tier 1 | musl >= 1.2 | |
 | macOS | Tier 1 | macOS >= 10.10 | |
 | Windows | Tier 1 | >= Windows 8 | MinGW-w64, >= VS 2019 |
 | Android | Tier 2 | | |
 | iOS | Tier 2 | | |
-| FreeBSD | Tier 2 | >= 11 | |
-| OpenBSD | Tier 2 | >= 6.7 | |
+| FreeBSD | Tier 2 | >= 12 | |
+| OpenBSD | Tier 2 | >= 7.4 | |
 | Linux | Tier 2 | uClibc | |
 
 
@@ -246,6 +254,7 @@ legend:
 * GNU C Library (glibc)
 * Windows C Run-Time Libraries (CRT)
 * uClibc
+* musl
 
 
 ### Supported compilers:
@@ -257,9 +266,8 @@ legend:
 
 ### Supported versions of OpenSSL
 
-* OpenSSL version 1.1.0
 * OpenSSL version 1.1.1
-* OpenSSL version 3.0.x
+* OpenSSL version 3.x.x
 * LibreSSL version 3.x
 
 

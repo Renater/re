@@ -46,12 +46,16 @@ static void update_resp_handler(int err, const struct sip_msg *msg, void *arg)
 	else if (msg->scode < 300) {
 		(void)sip_dialog_update(req->sess->dlg, msg);
 
-		if (req->sess->sent_offer)
+		if (req->sess->neg_state == SDP_NEG_LOCAL_OFFER) {
 			(void)req->sess->answerh(msg, req->sess->arg);
+			req->sess->neg_state = SDP_NEG_DONE;
+		}
 	}
 	else {
 		if (req->sess->terminated)
 			goto out;
+
+		req->sess->neg_state = SDP_NEG_DONE;
 
 		switch (msg->scode) {
 
@@ -118,10 +122,12 @@ static int send_handler(enum sip_transp tp, struct sa *src,
 
 static int update_request(struct sipsess_request *req)
 {
+	int err;
+
 	if (!req || req->tmr.th)
 		return -1;
 
-	return sip_drequestf(&req->req, req->sess->sip, true, "UPDATE",
+	err = sip_drequestf(&req->req, req->sess->sip, true, "UPDATE",
 			    req->sess->dlg, 0, req->sess->auth, send_handler,
 			    update_resp_handler, req,
 			    "%s%s%s"
@@ -134,6 +140,11 @@ static int update_request(struct sipsess_request *req)
 			    req->body ? mbuf_get_left(req->body) :(size_t)0,
 			    req->body ? mbuf_buf(req->body) : NULL,
 			    req->body ? mbuf_get_left(req->body):(size_t)0);
+
+	if (!err && req->sess->desc)
+		req->sess->neg_state = SDP_NEG_LOCAL_OFFER;
+
+	return err;
 }
 
 
@@ -152,17 +163,18 @@ int sipsess_update(struct sipsess *sess)
 	if (!sess || sess->terminated || !sess->ctype || !sess->desc)
 		return EINVAL;
 
-	sess->sent_offer = sess->desc ? true : false;
-	sess->modify_pending = false;
-
 	err = sipsess_request_alloc(&req, sess, sess->ctype, sess->desc, NULL,
 				    NULL);
 	if (err)
 		return err;
 
 	err = update_request(req);
-	if (err)
+	if (err) {
 		mem_deref(req);
+		return err;
+	}
+
+	sess->modify_pending = false;
 
 	return err;
 }

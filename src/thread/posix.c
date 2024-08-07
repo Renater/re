@@ -3,8 +3,6 @@
  *
  * Copyright (C) 2022 Sebastian Reimers
  */
-#define _GNU_SOURCE 1
-
 #include <re_types.h>
 #include <re_mem.h>
 #include <re_thread.h>
@@ -18,11 +16,12 @@ struct thread {
 
 static void *handler(void *p)
 {
-	struct thread th = *(struct thread *)p;
+	struct thread *th = p;
 
-	mem_deref(p);
+	int ret = th->func(th->arg);
+	mem_deref(th);
 
-	return (void *)(intptr_t)th.func(th.arg);
+	return (void *)(intptr_t)ret;
 }
 
 
@@ -128,6 +127,19 @@ int cnd_wait(cnd_t *cnd, mtx_t *mtx)
 		return thrd_error;
 
 	return (pthread_cond_wait(cnd, mtx) == 0) ? thrd_success : thrd_error;
+}
+
+
+int cnd_timedwait(cnd_t *cnd, mtx_t *mtx, const struct timespec *abstime)
+{
+	if (!cnd || !mtx || !abstime)
+		return thrd_error;
+
+	int ret = pthread_cond_timedwait(cnd, mtx, abstime);
+	if (ret == ETIMEDOUT)
+		return thrd_timedout;
+
+	return (ret == 0) ? thrd_success : thrd_error;
 }
 
 

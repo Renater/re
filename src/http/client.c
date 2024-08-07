@@ -20,13 +20,13 @@
 #include <re_dns.h>
 #include <re_msg.h>
 #include <re_http.h>
+#include <re_sys.h>
 #include "http.h"
 
 
 #define DEBUG_MODULE "http_client"
 #define DEBUG_LEVEL 5
 #include <re_dbg.h>
-
 
 enum {
 	CONN_TIMEOUT = 30000,
@@ -45,12 +45,10 @@ struct http_cli {
 	struct dnsc *dnsc;
 	struct tls *tls;
 	char *tlshn;
-	char *cert;
-	char *key;
+	struct mbuf *cert;
+	struct mbuf *key;
 	struct sa laddr;
-#ifdef HAVE_INET6
 	struct sa laddr6;
-#endif
 	size_t bufsize_max;
 };
 
@@ -561,17 +559,16 @@ static bool conn_cmp(struct le *le, void *arg)
 
 static int conn_connect(struct http_req *req)
 {
-	const struct sa *addr = &req->srvv[req->srvc];
-	struct conn *conn;
 	struct sa *laddr = NULL;
 	int err = 0;
 
-	conn = list_ledata(hash_lookup(req->cli->ht_conn,
+	if (!req || !req->cli)
+		return EINVAL;
+
+	const struct sa *addr = &req->srvv[req->srvc];
+	struct conn *conn = list_ledata(hash_lookup(req->cli->ht_conn,
 				       sa_hash(addr, SA_ALL), conn_cmp, req));
 	if (conn) {
-		if (!req->cli)
-			return EINVAL;
-
 		err = send_req_buf(conn);
 		if (!err) {
 			tmr_start(&conn->tmr, req->cli->conf.recv_timeout,
@@ -602,17 +599,18 @@ static int conn_connect(struct http_req *req)
 
 	if (sa_af(&conn->addr) == AF_INET)
 		laddr = &req->cli->laddr;
-#ifdef HAVE_INET6
 	else if (sa_af(&conn->addr) == AF_INET6)
 		laddr = &req->cli->laddr6;
-#endif
 
-	if (sa_isset(laddr, SA_ADDR))
+	if (sa_isset(laddr, SA_ADDR)) {
+		sa_set_scopeid(&conn->addr, sa_scopeid(laddr));
 		err = tcp_connect_bind(&conn->tc, addr, estab_handler,
 			recv_handler,close_handler, laddr, conn);
-	else
+	}
+	else {
 		err = tcp_connect(&conn->tc, addr, estab_handler, recv_handler,
 			close_handler, conn);
+	}
 	if (err)
 		goto out;
 
@@ -673,7 +671,7 @@ static bool rr_handler(struct dnsrr *rr, void *arg)
 {
 	struct http_req *req = arg;
 
-	if (req->srvc >= ARRAY_SIZE(req->srvv))
+	if (req->srvc >= RE_ARRAY_SIZE(req->srvv))
 		return true;
 
 	switch (rr->type) {
@@ -722,51 +720,6 @@ static void query_handler(int err, const struct dnshdr *hdr, struct list *ansl,
  fail:
 	req_close(req, err, NULL);
 }
-
-
-#ifdef USE_TLS
-static int read_file(char **pbuf, const char *path)
-{
-	FILE *f = NULL;
-	long s = 0;
-	size_t n = 0;
-	char *buf;
-
-	if (!pbuf || !path)
-		return EINVAL;
-
-	f = fopen(path, "r");
-	if (!f) {
-		DEBUG_WARNING("Could not open cert file '%s'\n", path);
-		return EIO;
-	}
-
-	fseek(f, 0L, SEEK_END);
-	s = ftell(f);
-	if (s < 0) {
-		fclose(f);
-		return errno;
-	}
-	fseek(f, 0L, SEEK_SET);
-
-	buf = mem_zalloc(s + 1, NULL);
-	if (!buf) {
-		DEBUG_WARNING("Could not allocate cert file buffer\n");
-		fclose(f);
-		return ENOMEM;
-	}
-
-	n = fread(buf, 1, s, f);
-	fclose(f);
-	if (n < (size_t)s) {
-		mem_deref(buf);
-		return EIO;
-	}
-
-	*pbuf = buf;
-	return 0;
-}
-#endif
 
 
 int http_uri_decode(struct http_uri *hu, const struct pl *uri)
@@ -901,12 +854,12 @@ int http_request(struct http_req **reqp, struct http_cli *cli, const char *met,
 #ifdef USE_TLS
 	if (cli->cert && cli->key) {
 		err = tls_set_certificate_pem(cli->tls,
-				cli->cert, strlen(cli->cert),
-				cli->key, strlen(cli->key));
+				(char *)cli->cert->buf, cli->cert->end,
+				(char *)cli->key->buf, cli->key->end);
 	}
 	else if (cli->cert) {
 		err = tls_set_certificate(cli->tls,
-				cli->cert, strlen(cli->cert));
+				(char *)cli->cert->buf, cli->cert->end);
 	}
 	if (err)
 		goto out;
@@ -921,16 +874,13 @@ int http_request(struct http_req **reqp, struct http_cli *cli, const char *met,
 			goto out;
 	}
 	else {
-#ifdef HAVE_INET6
 		struct sa tmp;
-#endif
 		err = dnsc_query(&req->dq, cli->dnsc, req->host,
 				 DNS_TYPE_A, DNS_CLASS_IN, true,
 				 query_handler, req);
 		if (err)
 			goto out;
 
-#ifdef HAVE_INET6
 		if (0 == net_default_source_addr_get(AF_INET6, &tmp)) {
 
 			err = dnsc_query(&req->dq6, cli->dnsc, req->host,
@@ -939,7 +889,6 @@ int http_request(struct http_req **reqp, struct http_cli *cli, const char *met,
 			if (err)
 				goto out;
 		}
-#endif
 	}
 
  out:
@@ -1137,7 +1086,7 @@ int http_client_set_cert(struct http_cli *cli, const char *path)
 		return EINVAL;
 
 	cli->cert = mem_deref(cli->cert);
-	err = read_file(&cli->cert, path);
+	err = fs_fread(&cli->cert, path);
 	if (err) {
 		cli->cert = mem_deref(cli->cert);
 		return err;
@@ -1149,8 +1098,9 @@ int http_client_set_cert(struct http_cli *cli, const char *path)
 
 /**
  * Set client certificate in PEM format
+ *
  * @param cli    HTTP Client
- * @param pem    Client certificate in PEM format
+ * @param pem    Client certificate as 0-terminated string in PEM format
  *
  * @return 0 for success, error code otherwise.
  */
@@ -1161,11 +1111,19 @@ int http_client_set_certpem(struct http_cli *cli, const char *pem)
 		return EINVAL;
 
 	cli->cert = mem_deref(cli->cert);
-
-	return str_dup(&cli->cert, pem);
+	cli->cert = mbuf_alloc(strlen(pem));
+	return mbuf_write_str(cli->cert, pem);
 }
 
 
+/**
+ * Set client key
+ *
+ * @param cli   HTTP Client
+ * @param path  File path to client key
+ *
+ * @return 0 for success, error code otherwise.
+ */
 int http_client_set_key(struct http_cli *cli, const char *path)
 {
 	int err = 0;
@@ -1174,7 +1132,7 @@ int http_client_set_key(struct http_cli *cli, const char *path)
 		return EINVAL;
 
 	cli->key = mem_deref(cli->key);
-	err = read_file(&cli->key, path);
+	err = fs_fread(&cli->key, path);
 	if (err) {
 		cli->key = mem_deref(cli->key);
 		return err;
@@ -1184,6 +1142,14 @@ int http_client_set_key(struct http_cli *cli, const char *path)
 }
 
 
+/**
+ * Set client key in PEM format
+ *
+ * @param cli    HTTP Client
+ * @param pem    Client key as 0-terminated string in PEM format
+ *
+ * @return 0 for success, error code otherwise.
+ */
 int http_client_set_keypem(struct http_cli *cli, const char *pem)
 {
 	if (!cli || !str_isset(pem))
@@ -1191,7 +1157,8 @@ int http_client_set_keypem(struct http_cli *cli, const char *pem)
 
 	cli->key = mem_deref(cli->key);
 
-	return str_dup(&cli->key, pem);
+	cli->key = mbuf_alloc(strlen(pem));
+	return mbuf_write_str(cli->key, pem);
 }
 
 
@@ -1239,7 +1206,7 @@ int http_client_set_session_reuse(struct http_cli *cli, bool enabled)
  * Set minimum TLS version
  *
  * @param cli       HTTP Client
- * @param version 	Minimum version, e.g.: TLS1_2_VERSION
+ * @param version   Minimum version, e.g.: TLS1_2_VERSION
  *
  * @return 0 if success, otherwise errorcode
  */
@@ -1253,10 +1220,10 @@ int http_client_set_tls_min_version(struct http_cli *cli, int version)
 
 
 /**
- * Set minimum TLS version
+ * Set maximum TLS version
  *
  * @param cli       HTTP Client
- * @param version 	Minimum version, e.g.: TLS1_2_VERSION
+ * @param version   Maximum version, e.g.: TLS1_2_VERSION
  *
  * @return 0 if success, otherwise errorcode
  */
@@ -1267,7 +1234,77 @@ int http_client_set_tls_max_version(struct http_cli *cli, int version)
 
 	return tls_set_max_proto_version(cli->tls, version);
 }
-#endif
+
+
+/**
+ * Disable TLS server certificate verification
+ *
+ * @param cli	HTTP Client
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int http_client_disable_verify_server(struct http_cli *cli)
+{
+	if (!cli)
+		return EINVAL;
+
+	tls_disable_verify_server(cli->tls);
+
+	return 0;
+}
+
+
+/**
+ * Change used certificate+key of TLS connection
+ *
+ * @param cli       HTTP Client
+ * @param chain     Cert (chain) + Key (PEM format)
+ * @param len_chain Length of certificate + key PEM string
+ *
+ * @return int 0 if success, otherwise errorcode
+ */
+int http_client_use_chainpem(struct http_cli *cli, const char *chain,
+			     int len_chain)
+{
+	if (!cli || !cli->tls)
+		return EINVAL;
+
+	int err = tls_set_certificate_chain_pem(cli->tls, chain, len_chain);
+	if (err)
+		return err;
+
+	cli->cert = mem_deref(cli->cert);
+	cli->key = mem_deref(cli->key);
+
+	return 0;
+}
+
+
+/**
+ * Change used certificate+key of TLS connection
+ *
+ * @param cli  HTTP Client
+ * @param path Path to Cert (chain) + Key file (PEM format)
+ *
+ * @return int 0 if success, otherwise errorcode
+ */
+int http_client_use_chain(struct http_cli *cli, const char *path)
+{
+	int err;
+
+	if (!cli || !cli->tls)
+		return EINVAL;
+
+	err =  tls_set_certificate_chain(cli->tls, path);
+	if (err)
+		return err;
+
+	cli->cert = mem_deref(cli->cert);
+	cli->key = mem_deref(cli->key);
+
+	return 0;
+}
+#endif /* USE_TLS */
 
 
 /**
@@ -1293,13 +1330,8 @@ void http_client_set_laddr(struct http_cli *cli, const struct sa *addr)
  */
 void http_client_set_laddr6(struct http_cli *cli, const struct sa *addr)
 {
-#ifdef HAVE_INET6
 	if (cli && addr)
 		sa_cpy(&cli->laddr6, addr);
-#else
-	(void)cli;
-	(void)addr;
-#endif
 }
 
 

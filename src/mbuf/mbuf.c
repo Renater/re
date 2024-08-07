@@ -49,6 +49,34 @@ struct mbuf *mbuf_alloc(size_t size)
 
 
 /**
+ * Duplicate memory buffer
+ *
+ * @param mbd Memory buffer to duplicate
+ *
+ * @return Duplicated memory buffer, NULL if no memory
+ */
+struct mbuf *mbuf_dup(struct mbuf *mbd)
+{
+	struct mbuf *mb;
+
+	if (!mbd)
+		return NULL;
+
+	mb = mbuf_alloc(mbd->size);
+	if (!mb)
+		return NULL;
+
+	mb->size = mbd->size;
+	mb->pos	 = mbd->pos;
+	mb->end	 = mbd->end;
+
+	memcpy(mb->buf, mbd->buf, mbd->size);
+
+	return mb;
+}
+
+
+/**
  * Allocate a new memory buffer with a reference to another mbuf
  *
  * @param mbr Memory buffer to reference
@@ -233,6 +261,20 @@ int mbuf_write_mem(struct mbuf *mb, const uint8_t *buf, size_t size)
 
 
 /**
+ * Write an Pointer to a memory buffer
+ *
+ * @param mb Memory buffer
+ * @param v  Pointer to write
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int mbuf_write_ptr(struct mbuf *mb, intptr_t v)
+{
+	return mbuf_write_mem(mb, (uint8_t *)&v, sizeof(v));
+}
+
+
+/**
  * Write an 8-bit value to a memory buffer
  *
  * @param mb Memory buffer
@@ -337,7 +379,7 @@ int mbuf_read_mem(struct mbuf *mb, uint8_t *buf, size_t size)
 		return EINVAL;
 
 	if (size > mbuf_get_left(mb)) {
-		DEBUG_WARNING("tried to read beyond mbuf end (%u > %u)\n",
+		DEBUG_WARNING("tried to read beyond mbuf end (%zu > %zu)\n",
 			      size, mbuf_get_left(mb));
 		return EOVERFLOW;
 	}
@@ -347,6 +389,21 @@ int mbuf_read_mem(struct mbuf *mb, uint8_t *buf, size_t size)
 	mb->pos += size;
 
 	return 0;
+}
+
+
+/**
+ * Read an Pointer from a memory buffer
+ *
+ * @param mb Memory buffer
+ *
+ * @return Pointer on success, otherwise 0
+ */
+intptr_t mbuf_read_ptr(struct mbuf *mb)
+{
+	intptr_t v;
+
+	return (0 == mbuf_read_mem(mb, (uint8_t *)&v, sizeof(v))) ? v : 0;
 }
 
 
@@ -503,13 +560,34 @@ int mbuf_vprintf(struct mbuf *mb, const char *fmt, va_list ap)
  *
  * @return 0 if success, otherwise errorcode
  */
-int mbuf_printf(struct mbuf *mb, const char *fmt, ...)
+int _mbuf_printf(struct mbuf *mb, const char *fmt, ...)
 {
 	int err = 0;
 	va_list ap;
 
 	va_start(ap, fmt);
 	err = re_vhprintf(fmt, ap, vprintf_handler, mb);
+	va_end(ap);
+
+	return err;
+}
+
+
+/**
+ * Print a safe formatted string to a memory buffer
+ *
+ * @param mb  Memory buffer
+ * @param fmt Formatted string
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int _mbuf_printf_s(struct mbuf *mb, const char *fmt, ...)
+{
+	int err = 0;
+	va_list ap;
+
+	va_start(ap, fmt);
+	err = re_vhprintf_s(fmt, ap, vprintf_handler, mb);
 	va_end(ap);
 
 	return err;
@@ -587,6 +665,37 @@ int mbuf_fill(struct mbuf *mb, uint8_t c, size_t n)
 	mb->end  = MAX(mb->end, mb->pos);
 
 	return 0;
+}
+
+
+/**
+ * Set absolute position and end position
+ *
+ * @param mb  Memory buffer
+ * @param pos Position
+ * @param end End position
+ */
+void mbuf_set_posend(struct mbuf *mb, size_t pos, size_t end)
+{
+	if (!mb)
+		return;
+
+	if (pos > end) {
+		DEBUG_WARNING("set_posend: pos %zu > end %zu\n",
+			      pos, end);
+		return;
+	}
+	if (end > mb->size) {
+		DEBUG_WARNING("set_posend: end %zu > size %zu\n",
+			      end, mb->size);
+		return;
+	}
+
+	mb->pos = pos;
+	mb->end = end;
+
+	MBUF_CHECK_POS(mb);
+	MBUF_CHECK_END(mb);
 }
 
 

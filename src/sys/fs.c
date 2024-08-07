@@ -3,9 +3,6 @@
  *
  * Copyright (C) 2010 Creytiv.com
  */
-#define _DEFAULT_SOURCE 1
-#define _BSD_SOURCE 1
-#define _POSIX_C_SOURCE 1
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -29,6 +26,13 @@
 #include <re_types.h>
 #include <re_fmt.h>
 #include <re_sys.h>
+#include <re_mem.h>
+#include <re_mbuf.h>
+
+
+#define DEBUG_MODULE "fs"
+#define DEBUG_LEVEL 5
+#include <re_dbg.h>
 
 
 #ifdef WIN32
@@ -39,6 +43,8 @@
 #define dup2 _dup2
 #define fileno _fileno
 #endif
+
+#define MINBUF_SIZE 1024
 
 
 static int dup_stdout = -1;
@@ -193,10 +199,10 @@ int fs_fopen(FILE **fp, const char *file, const char *mode)
 	FILE *pfile;
 	int fd;
 
-	if (!fp || !file || !mode)
+	if (!fp || !file || !str_isset(mode))
 		return EINVAL;
 
-	if (fs_isfile(file))
+	if (mode[0] == 'r' || fs_isfile(file))
 		goto fopen;
 
 	fd = open(file, O_WRONLY | O_CREAT, S_IWUSR | S_IRUSR);
@@ -229,8 +235,13 @@ void fs_stdio_hide(void)
 #else
 	int fd = open("/dev/null", O_WRONLY);
 #endif
+	if (fd < 0)
+		return;
+
 	(void)dup2(fd, fileno(stdout));
 	(void)dup2(fd, fileno(stderr));
+
+	close(fd);
 }
 
 
@@ -244,4 +255,54 @@ void fs_stdio_restore(void)
 
 	(void)dup2(dup_stdout, fileno(stdout));
 	(void)dup2(dup_stderr, fileno(stderr));
+}
+
+
+int fs_fread(struct mbuf **mbp, const char *path)
+{
+	FILE *f = NULL;
+	size_t n = 0;
+	void *buf = NULL;
+	struct mbuf *mb = NULL;
+	int err;
+
+	if (!mbp || !path)
+		return EINVAL;
+
+	err = fs_fopen(&f, path, "r");
+	if (err) {
+		DEBUG_WARNING("Could not open file '%s'\n", path);
+		return err;
+	}
+
+	mb = mbuf_alloc(MINBUF_SIZE);
+	buf = mem_zalloc(MINBUF_SIZE, NULL);
+	if (!mb || !buf) {
+		err = ENOMEM;
+		goto out;
+	}
+
+	while (1) {
+		n = fread(buf, 1, MINBUF_SIZE, f);
+		if (!n)
+			goto out;
+
+		err = mbuf_write_mem(mb, buf, n);
+		if (err) {
+			DEBUG_WARNING("Error reading file '%s' (%m)\n",
+				path, err);
+			goto out;
+		}
+	}
+
+out:
+	fclose(f);
+
+	mem_deref(buf);
+	if (err)
+		mem_deref(mb);
+	else
+		*mbp = mb;
+
+	return err;
 }

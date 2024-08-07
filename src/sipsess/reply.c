@@ -26,7 +26,8 @@ struct sipsess_reply {
 	const struct sip_msg *msg;
 	struct mbuf *mb;
 	struct sipsess *sess;
-	bool awaiting_answer;
+	bool awaiting_prack;
+	uint16_t scode;
 	uint32_t seq;
 	uint32_t rel_seq;
 	uint32_t txc;
@@ -50,19 +51,25 @@ static void tmr_handler(void *arg)
 	struct sipsess_reply *reply = arg;
 	struct sipsess *sess = reply->sess;
 
-	mem_deref(reply);
-
-	/* wait for all pending ACKs */
-	if (sess->replyl.head)
-		return;
-
 	/* we want to send bye */
-	sess->established = true;
 
-	if (!sess->terminated)
-		sipsess_terminate(sess, ETIMEDOUT, NULL);
-	else
+	if (!sess->terminated) {
+		if (reply->scode < 200 && !sess->established) {
+			(void)sip_reply(sess->sip, reply->msg, 504,
+					"Timeout");
+		}
+		else {
+			sess->established = true;
+			mem_deref(reply);
+			sipsess_terminate(sess, ETIMEDOUT, NULL);
+			return;
+		}
+	}
+	else {
 		mem_deref(sess);
+	}
+
+	mem_deref(reply);
 }
 
 
@@ -83,6 +90,20 @@ static void retransmit_handler(void *arg)
 }
 
 
+static bool cancel_1xx_timers(struct le *le, void *arg)
+{
+	struct sipsess_reply *reply = le->data;
+	(void)arg;
+
+	if (reply->scode > 100 && reply->scode < 200) {
+		tmr_cancel(&reply->tmr);
+		tmr_cancel(&reply->tmrg);
+	}
+
+	return false;
+}
+
+
 int sipsess_reply_2xx(struct sipsess *sess, const struct sip_msg *msg,
 		      uint16_t scode, const char *reason, struct mbuf *desc,
 		      const char *fmt, va_list *ap)
@@ -90,21 +111,33 @@ int sipsess_reply_2xx(struct sipsess *sess, const struct sip_msg *msg,
 	struct sipsess_reply *reply = NULL;
 	struct sip_contact contact;
 	int err = ENOMEM;
+	bool sdp = mbuf_get_left(msg->mb) > 0;
 	bool non_invite = !pl_strcmp(&msg->met, "PRACK")
 			  || !pl_strcmp(&msg->met, "UPDATE");
 
 	if (!non_invite) {
+		if (sess->neg_state == SDP_NEG_NONE && !mbuf_get_left(desc))
+			return EINVAL;
+		else if (sess->neg_state == SDP_NEG_DONE)
+			desc = NULL;
+
+		if (sess->prack_waiting_cnt > 0)
+			return EINVAL;
+
 		reply = mem_zalloc(sizeof(*reply), destructor);
 		if (!reply)
 			goto out;
 
 		list_append(&sess->replyl, &reply->le, reply);
 
-		reply->rel_seq = 0;
 		reply->seq  = msg->cseq.num;
 		reply->msg  = mem_ref((void *)msg);
+		reply->scode = scode;
 		reply->sess = sess;
 	}
+
+	if (non_invite && sess->neg_state != SDP_NEG_REMOTE_OFFER)
+		desc = NULL;
 
 	sip_contact_set(&contact, sess->cuser, &msg->dst, msg->tp);
 	err = sip_treplyf(non_invite ? NULL : &sess->st,
@@ -128,14 +161,20 @@ int sipsess_reply_2xx(struct sipsess *sess, const struct sip_msg *msg,
 	if (err)
 		goto out;
 
+	if (!non_invite)
+		(void)list_ledata(list_apply(&sess->replyl, false,
+				  cancel_1xx_timers, NULL));
+
+	if (mbuf_get_left(desc)) {
+		if (sdp)
+			sess->neg_state = SDP_NEG_DONE;
+		else if (!non_invite)
+			sess->neg_state = SDP_NEG_LOCAL_OFFER;
+	}
+
 	if (reply) {
 		tmr_start(&reply->tmr, 64 * SIP_T1, tmr_handler, reply);
 		tmr_start(&reply->tmrg, SIP_T1, retransmit_handler, reply);
-
-		if (!mbuf_get_left(msg->mb) && desc) {
-			reply->awaiting_answer = true;
-			sess->awaiting_answer = true;
-		}
 	}
 
  out:
@@ -155,7 +194,6 @@ int sipsess_reply_1xx(struct sipsess *sess, const struct sip_msg *msg,
 		      enum rel100_mode rel100, struct mbuf *desc,
 		      const char *fmt, va_list *ap)
 {
-	struct sipsess_reply *prev;
 	struct sipsess_reply *reply;
 	struct sip_contact contact;
 	char rseq_header[64];
@@ -174,16 +212,32 @@ int sipsess_reply_1xx(struct sipsess *sess, const struct sip_msg *msg,
 				  421, "Extension required",
 				  "Require: 100rel\r\n"
 				  "Content-Length: 0\r\n\r\n");
-		return -1;
+		return EPROTO;
 	}
 	else if (rel100_peer == REL100_REQUIRED && !rel100) {
 		(void)sip_treplyf(&sess->st, NULL, sess->sip, msg, false, 420,
 				  "Bad Extension", "Unsupported: 100rel\r\n"
 				  "Content-Length: 0\r\n\r\n");
-		return -1;
+		return EPROTO;
 	}
 
-	reliably = rel100 && rel100_peer;
+	reliably = rel100 && rel100_peer && scode != 100;
+
+	if (reliably && sess->neg_state == SDP_NEG_NONE
+	    && !mbuf_get_left(desc))
+		return EINVAL;
+
+	if (sess->neg_state == SDP_NEG_NONE) {
+		if (reliably && !mbuf_get_left(desc))
+			return EINVAL;
+		else if (!reliably)
+			desc = NULL;
+	}
+	else if (sess->neg_state == SDP_NEG_DONE
+		 || sess->neg_state == SDP_NEG_LOCAL_OFFER) {
+		desc = NULL;
+	}
+
 	if (rel100 != REL100_REQUIRED && reliably) {
 		pl_set_str(&require_header, "Require: 100rel\r\n");
 	}
@@ -192,15 +246,16 @@ int sipsess_reply_1xx(struct sipsess *sess, const struct sip_msg *msg,
 	if (!reply)
 		goto out;
 
-	prev = list_ledata(list_tail(&sess->replyl));
 	list_append(&sess->replyl, &reply->le, reply);
 	reply->seq  = msg->cseq.num;
 	reply->msg  = mem_ref((void *)msg);
 	reply->sess = sess;
+	reply->scode = scode;
 
 	sip_contact_set(&contact, sess->cuser, &msg->dst, msg->tp);
 	if (reliably) {
-		reply->rel_seq = prev ? prev->rel_seq+1 : rand_u16();
+		sess->rel_seq = sess->rel_seq ? sess->rel_seq+1 : rand_u16();
+		reply->rel_seq = sess->rel_seq;
 		re_snprintf(rseq_header, sizeof(rseq_header),
 					"%d", reply->rel_seq);
 	}
@@ -218,7 +273,7 @@ int sipsess_reply_1xx(struct sipsess *sess, const struct sip_msg *msg,
 			  require_header.p ? require_header.p : "",
 			  reliably ? "RSeq: " : "",
 			  reliably ? rseq_header : "",
-			  reliably ? "\n" : "",
+			  reliably ? "\r\n" : "",
 			  desc ? "Content-Type: " : "",
 			  desc ? sess->ctype : "",
 			  desc ? "\r\n" : "",
@@ -232,14 +287,19 @@ int sipsess_reply_1xx(struct sipsess *sess, const struct sip_msg *msg,
 	if (reliably) {
 		tmr_start(&reply->tmr, 64 * SIP_T1, tmr_handler, reply);
 		tmr_start(&reply->tmrg, SIP_T1, retransmit_handler, reply);
+
+		if (desc) {
+			++sess->prack_waiting_cnt;
+			reply->awaiting_prack = true;
+			sess->neg_state = mbuf_get_left(msg->mb) ?
+				SDP_NEG_DONE : SDP_NEG_LOCAL_OFFER;
+		}
 	}
 	else {
-		mem_deref(reply);
-	}
+		if (desc && sess->neg_state == SDP_NEG_REMOTE_OFFER)
+			sess->neg_state = SDP_NEG_PREVIEW_ANSWER;
 
-	if (!mbuf_get_left(msg->mb) && desc) {
-		reply->awaiting_answer = true;
-		sess->awaiting_answer = true;
+		mem_deref(reply);
 	}
 
  out:
@@ -252,23 +312,45 @@ int sipsess_reply_1xx(struct sipsess *sess, const struct sip_msg *msg,
 }
 
 
+static bool cmp_handler_prack(struct le *le, void *arg)
+{
+	struct sipsess_reply *reply = le->data;
+	const struct sip_msg *msg = arg;
+
+	return msg->rack.cseq == reply->seq &&
+			msg->rack.rel_seq == reply->rel_seq &&
+			!pl_cmp(&msg->rack.met, &reply->msg->met);
+}
+
+
 static bool cmp_handler(struct le *le, void *arg)
 {
 	struct sipsess_reply *reply = le->data;
 	const struct sip_msg *msg = arg;
 
-	if (!pl_strcmp(&msg->met, "PRACK")) {
-		return msg->rack.cseq == reply->seq &&
-				msg->rack.rel_seq == reply->rel_seq &&
-				!pl_cmp(&msg->rack.met, &reply->msg->met);
-	}
-
 	return msg->cseq.num == reply->seq;
 }
 
 
-int sipsess_reply_ack(struct sipsess *sess, const struct sip_msg *msg,
-		      bool *awaiting_answer)
+int sipsess_reply_prack(struct sipsess *sess, const struct sip_msg *msg,
+			bool *awaiting_prack)
+{
+	struct sipsess_reply *reply;
+
+	reply = list_ledata(list_apply(&sess->replyl, false, cmp_handler_prack,
+				       (void *)msg));
+	if (!reply)
+		return ENOENT;
+
+	*awaiting_prack = reply->awaiting_prack;
+
+	mem_deref(reply);
+
+	return 0;
+}
+
+
+int sipsess_reply_ack(struct sipsess *sess, const struct sip_msg *msg)
 {
 	struct sipsess_reply *reply;
 
@@ -276,8 +358,6 @@ int sipsess_reply_ack(struct sipsess *sess, const struct sip_msg *msg,
 				       (void *)msg));
 	if (!reply)
 		return ENOENT;
-
-	*awaiting_answer = reply->awaiting_answer;
 
 	mem_deref(reply);
 

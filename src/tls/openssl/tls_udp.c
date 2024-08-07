@@ -34,6 +34,15 @@ enum {
 };
 
 
+/* TLS ContentType defined in RFC 5246 */
+enum content_type {
+       TYPE_CHANGE_CIPHER_SPEC = 20,
+       TYPE_ALERT              = 21,
+       TYPE_HANDSHAKE          = 22,
+       TYPE_APPLICATION_DATA   = 23
+};
+
+
 struct dtls_sock {
 	struct sa peer;
 	struct udp_helper *uh;
@@ -43,6 +52,7 @@ struct dtls_sock {
 	dtls_conn_h *connh;
 	void *arg;
 	size_t mtu;
+	bool single_conn;  /* If enabled, only one DTLS connection */
 };
 
 
@@ -50,6 +60,7 @@ struct dtls_sock {
 struct tls_conn {
 	SSL *ssl;             /* inheritance */
 	struct tls *tls;      /* inheritance */
+	struct tls_conn_d cd; /* inheritance */
 	BIO_METHOD *biomet;
 	BIO *sbio_out;
 	BIO *sbio_in;
@@ -64,6 +75,36 @@ struct tls_conn {
 	bool active;
 	bool up;
 };
+
+
+#if DEBUG_LEVEL >= 6
+static const char *content_type_str(enum content_type content_type)
+{
+	switch (content_type) {
+
+	case TYPE_CHANGE_CIPHER_SPEC: return "CHANGE_CIPHER_SPEC";
+	case TYPE_ALERT:              return "ALERT";
+	case TYPE_HANDSHAKE:          return "HANDSHAKE";
+	case TYPE_APPLICATION_DATA:   return "APPLICATION_DATA";
+	default: return "???";
+	}
+}
+#endif
+
+
+static bool first_handler(struct le *le, void *arg)
+{
+	(void)le;
+	(void)arg;
+
+	return true;  /* stop on the first element */
+}
+
+
+static struct le *hash_get_first(const struct hash *ht)
+{
+	return hash_apply(ht, first_handler, NULL);
+}
 
 
 static int bio_create(BIO *b)
@@ -201,8 +242,6 @@ static void conn_close(struct tls_conn *tc, int err)
 }
 
 
-#if defined (DTLS_CTRL_HANDLE_TIMEOUT) && defined(DTLS_CTRL_GET_TIMEOUT)
-
 static void check_timer(struct tls_conn *tc);
 
 
@@ -236,15 +275,6 @@ static void check_timer(struct tls_conn *tc)
 		tmr_cancel(&tc->tmr);
 	}
 }
-
-#else
-
-static void check_timer(struct tls_conn *tc)
-{
-	(void)tc;
-}
-
-#endif
 
 
 static int tls_connect(struct tls_conn *tc)
@@ -323,7 +353,7 @@ static void conn_recv(struct tls_conn *tc, struct mbuf *mb)
 
 	if (SSL_state(tc->ssl) != SSL_ST_OK) {
 
-		if (tc->up) {
+		if (tc->up && !SSL_get_secure_renegotiation_support(tc->ssl)) {
 			conn_close(tc, EPROTO);
 			return;
 		}
@@ -408,13 +438,10 @@ static void conn_recv(struct tls_conn *tc, struct mbuf *mb)
 		mb->pos += n;
 	}
 
-	mbuf_set_end(mb, mb->pos);
-	mbuf_set_pos(mb, 0);
+	mbuf_set_posend(mb, 0, mb->pos);
 
 	if (tc->recvh && mbuf_get_left(mb) > 0)
 		tc->recvh(mb, tc->arg);
-
-	return;
 }
 
 
@@ -425,6 +452,13 @@ static int conn_alloc(struct tls_conn **ptc, struct tls *tls,
 {
 	struct tls_conn *tc;
 	int err = 0;
+
+	if (sock->single_conn) {
+		if (hash_get_first(sock->ht)) {
+			DEBUG_WARNING("single: only one connection allowed\n");
+			return EMFILE;
+		}
+	}
 
 	tc = mem_zalloc(sizeof(*tc), conn_destructor);
 	if (!tc)
@@ -695,6 +729,11 @@ static bool cmp_handler(struct le *le, void *arg)
 static struct tls_conn *conn_lookup(struct dtls_sock *sock,
 				    const struct sa *peer)
 {
+	if (sock->single_conn) {
+		struct le *le = hash_get_first(sock->ht);
+		return list_ledata(le);
+	}
+
 	return list_ledata(hash_lookup(sock->ht, sa_hash(peer, SA_ALL),
                                        cmp_handler, (void *)peer));
 }
@@ -712,6 +751,8 @@ static bool recv_handler(struct sa *src, struct mbuf *mb, void *arg)
 	b = mb->buf[mb->pos];
 	if (b < 20 || b > 63)
 		return false;
+
+	DEBUG_INFO("receive '%s' from %J\n", content_type_str(b), src);
 
 	tc = conn_lookup(sock, src);
 	if (tc) {
@@ -819,6 +860,13 @@ void dtls_set_mtu(struct dtls_sock *sock, size_t mtu)
 }
 
 
+/**
+ * Receive a DTLS packet
+ *
+ * @param sock DTLS Socket
+ * @param src  Source network address
+ * @param mb   Mbuffer with DTLS packet
+ */
 void dtls_recv_packet(struct dtls_sock *sock, const struct sa *src,
 		      struct mbuf *mb)
 {
@@ -830,4 +878,19 @@ void dtls_recv_packet(struct dtls_sock *sock, const struct sa *src,
 	addr = *src;
 
 	recv_handler(&addr, mb, sock);
+}
+
+
+/**
+ * Set single connection mode. If enabled, only one DTLS connection is allowed.
+ *
+ * @param sock   DTLS Socket
+ * @param single True to enable, False to disable
+ */
+void dtls_set_single(struct dtls_sock *sock, bool single)
+{
+	if (!sock)
+		return;
+
+	sock->single_conn = single;
 }

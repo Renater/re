@@ -103,6 +103,7 @@ int rtcp_send_pli(struct rtp_sock *rs, uint32_t fb_ssrc)
 			       rtp_sess_ssrc(rs), fb_ssrc, NULL, NULL);
 }
 
+
 static int encode_fir_rfc5104_fci(struct mbuf *mb, void *arg)
 {
 	struct fir_rfc5104 *fci = arg;
@@ -113,6 +114,7 @@ static int encode_fir_rfc5104_fci(struct mbuf *mb, void *arg)
 	err |= mbuf_write_u8(mb, 0);
 	return err;
 }
+
 
 /**
  * Send an RTCP Full INTRA-frame Request (FIR) packet according to RFC 5104
@@ -131,6 +133,14 @@ int rtcp_send_fir_rfc5104(struct rtp_sock *rs, uint32_t ssrc, uint8_t fir_seqn)
 			       &encode_fir_rfc5104_fci, &fci);
 }
 
+
+/**
+ * Get the name of an RTCP type
+ *
+ * @param type RTCP type
+ *
+ * @return String with RTCP name
+ */
 const char *rtcp_type_name(enum rtcp_type type)
 {
 	switch (type) {
@@ -151,6 +161,13 @@ const char *rtcp_type_name(enum rtcp_type type)
 }
 
 
+/**
+ * Get the name of an RTCP SDES type
+ *
+ * @param sdes RTCP SDES type
+ *
+ * @return String with RTCP SDES name
+ */
 const char *rtcp_sdes_name(enum rtcp_sdes_type sdes)
 {
 	switch (sdes) {
@@ -279,6 +296,21 @@ int rtcp_msg_print(struct re_printf *pf, const struct rtcp_msg *msg)
 						  msg->r.fb.fci.gnackv[i].blp);
 			}
 		}
+		else if (msg->hdr.count == RTCP_RTPFB_TWCC) {
+			const struct twcc *twcc = msg->r.fb.fci.twccv;
+
+			err |= re_hprintf(pf,
+					  " TWCC"
+					  " base_seq=%u"
+					  " pkt_status_count=%u"
+					  " ref_time=%u"
+					  " fb_pkt_count=%u"
+					  ,
+					  twcc->seq,
+					  twcc->count,
+					  twcc->reftime,
+					  twcc->fbcount);
+		}
 		break;
 
 	case RTCP_PSFB:
@@ -321,6 +353,13 @@ int rtcp_msg_print(struct re_printf *pf, const struct rtcp_msg *msg)
 }
 
 
+/**
+ * Check if packet is RTCP packet, used for de-multiplexing
+ *
+ * @param mb Mbuffer with packet
+ *
+ * @return True if RTCP packet, otherwise false
+ */
 bool rtp_is_rtcp_packet(const struct mbuf *mb)
 {
 	uint8_t pt;

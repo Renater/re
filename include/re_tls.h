@@ -28,6 +28,17 @@ enum tls_keytype {
 	TLS_KEYTYPE_EC,
 };
 
+enum tls_resume_mode {
+	TLS_RESUMPTION_NONE	= 0,
+	TLS_RESUMPTION_IDS	= (1 << 0),
+	TLS_RESUMPTION_TICKETS	= (1 << 1),
+	TLS_RESUMPTION_ALL	= TLS_RESUMPTION_IDS | TLS_RESUMPTION_TICKETS,
+};
+
+struct tls_conn_d {
+	int (*verifyh) (int ok, void *arg);
+	void *arg;
+};
 
 int tls_alloc(struct tls **tlsp, enum tls_method method, const char *keyfile,
 	      const char *pwd);
@@ -45,7 +56,14 @@ int tls_set_certificate_der(struct tls *tls, enum tls_keytype keytype,
 			    const uint8_t *cert, size_t len_cert,
 			    const uint8_t *key, size_t len_key);
 int tls_set_certificate(struct tls *tls, const char *cert, size_t len);
+int tls_set_certificate_chain_pem(struct tls *tls, const char *chain,
+				  size_t len_chain);
+int tls_set_certificate_chain(struct tls *tls, const char *path);
 void tls_set_verify_client(struct tls *tls);
+void tls_set_verify_client_trust_all(struct tls *tls);
+int tls_set_verify_client_handler(struct tls_conn *tc, int depth,
+	int (*verifyh) (int ok, void *arg), void *arg);
+
 int tls_set_srtp(struct tls *tls, const char *suites);
 int tls_fingerprint(const struct tls *tls, enum tls_fingerprint type,
 		    uint8_t *md, size_t size);
@@ -61,10 +79,13 @@ int tls_srtp_keyinfo(const struct tls_conn *tc, enum srtp_suite *suite,
 const char *tls_cipher_name(const struct tls_conn *tc);
 int tls_set_ciphers(struct tls *tls, const char *cipherv[], size_t count);
 int tls_set_verify_server(struct tls_conn *tc, const char *host);
+int tls_verify_client(struct tls_conn *tc);
 
 int tls_get_issuer(struct tls *tls, struct mbuf *mb);
 int tls_get_subject(struct tls *tls, struct mbuf *mb);
 void tls_disable_verify_server(struct tls *tls);
+void tls_enable_verify_client(struct tls *tls, bool enable);
+int tls_set_resumption(struct tls *tls, const enum tls_resume_mode mode);
 
 int tls_set_min_proto_version(struct tls *tls, int version);
 int tls_set_max_proto_version(struct tls *tls, int version);
@@ -74,12 +95,15 @@ bool tls_get_session_reuse(const struct tls_conn *tc);
 int tls_reuse_session(const struct tls_conn *tc);
 bool tls_session_reused(const struct tls_conn *tc);
 int tls_update_sessions(const struct tls_conn *tc);
+void tls_set_posthandshake_auth(struct tls *tls, int value);
 
 /* TCP */
 
 int tls_conn_change_cert(struct tls_conn *tc, const char *file);
 int tls_start_tcp(struct tls_conn **ptc, struct tls *tls,
 		  struct tcp_conn *tcp, int layer);
+
+int tls_verify_client_post_handshake(struct tls_conn *tc);
 
 const struct tcp_conn *tls_get_tcp_conn(const struct tls_conn *tc);
 
@@ -113,6 +137,7 @@ const struct sa *dtls_peer(const struct tls_conn *tc);
 void dtls_set_peer(struct tls_conn *tc, const struct sa *peer);
 void dtls_recv_packet(struct dtls_sock *sock, const struct sa *src,
 		      struct mbuf *mb);
+void dtls_set_single(struct dtls_sock *sock, bool single);
 
 
 struct x509_st;
@@ -120,3 +145,4 @@ struct evp_pkey_st;
 
 int tls_set_certificate_openssl(struct tls *tls, struct x509_st *cert,
 				struct evp_pkey_st *pkey, bool up_ref);
+int tls_add_certf(struct tls *tls, const char *certf, const char *host);

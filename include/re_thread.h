@@ -13,6 +13,9 @@
  * Copyright (C) 2022 Sebastian Reimers
  */
 
+#ifndef RE_H_THREAD__
+#define RE_H_THREAD__
+
 #if defined(HAVE_THREADS)
 #include <threads.h>
 
@@ -20,6 +23,9 @@
 
 #if defined(WIN32)
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #define ONCE_FLAG_INIT INIT_ONCE_STATIC_INIT
 typedef INIT_ONCE once_flag;
@@ -176,6 +182,19 @@ int cnd_wait(cnd_t *cnd, mtx_t *mtx);
 
 
 /**
+ * Blocks on a condition variable with timeout (TIME_UTC based)
+ *
+ * @param cnd     Pointer to condition variable
+ * @param mtx     Lock mutex pointer
+ * @param abstime Pointer to timeout time
+ *
+ * @return thrd_success on success, thrd_timedout if the timeout time
+ * has been reached before the mutex is locked, otherwise thrd_error
+ */
+int cnd_timedwait(cnd_t *cnd, mtx_t *mtx, const struct timespec *abstime);
+
+
+/**
  * Destroys the condition variable pointed to by cnd.
  * If there are thrds waiting on cnd, the behavior is undefined.
  *
@@ -218,7 +237,7 @@ int mtx_lock(mtx_t *mtx);
  *
  * @param mtx   Pointer to the mutex
  *
- * @return thrd_success on success, thrd_busy if alread locked,
+ * @return thrd_success on success, thrd_busy if already locked,
  * otherwise thrd_error
  */
 int mtx_trylock(mtx_t *mtx);
@@ -272,6 +291,7 @@ void tss_delete(tss_t key);
  * @return 0 if success, otherwise errorcode
  */
 int mutex_alloc(mtx_t **mtx);
+int mutex_alloc_tp(mtx_t **mtx, int type);
 
 
 /**
@@ -286,3 +306,5 @@ int mutex_alloc(mtx_t **mtx);
  */
 int thread_create_name(thrd_t *thr, const char *name, thrd_start_t func,
 		     void *arg);
+
+#endif /* RE_H_THREAD__ */

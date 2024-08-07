@@ -28,7 +28,7 @@ static void pace_next(struct icem *icem)
 
 	icem_conncheck_schedule_check(icem);
 
-	if (icem->state == ICE_CHECKLIST_FAILED)
+	if (icem->state != ICE_CHECKLIST_RUNNING)
 		return;
 
 	icem_checklist_update(icem);
@@ -400,6 +400,20 @@ static void pace_timeout(void *arg)
 }
 
 
+static void rcand_wait_timeout(void *arg)
+{
+	struct icem *icem = arg;
+
+	/* Avoid long startup delay */
+	icem->rcand_wait = false;
+
+	icem_printf(icem, "conncheck_start: "
+			"mDNS timeout for remote candidate...\n");
+
+	icem_conncheck_start(icem);
+}
+
+
 /**
  * Scheduling Checks
  *
@@ -414,6 +428,13 @@ int icem_conncheck_start(struct icem *icem)
 	if (!icem)
 		return EINVAL;
 
+	if (icem->rcand_wait) {
+		icem_printf(icem, "conncheck_start: "
+				  "waiting mDNS for remote candidate...\n");
+		tmr_start(&icem->tmr_rcand, 100, rcand_wait_timeout, icem);
+		return 0;
+	}
+
 	err = icem_checklist_form(icem);
 	if (err)
 		return err;
@@ -425,7 +446,7 @@ int icem_conncheck_start(struct icem *icem)
 		    list_count(&icem->checkl));
 
 	/* add some delay, to wait for call to be 'established' */
-	tmr_start(&icem->tmr_pace, 10, pace_timeout, icem);
+	tmr_start(&icem->tmr_pace, 0, pace_timeout, icem);
 
 	return 0;
 }

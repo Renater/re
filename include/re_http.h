@@ -169,27 +169,45 @@ int http_client_set_cert(struct http_cli *cli, const char *path);
 int http_client_set_certpem(struct http_cli *cli, const char *pem);
 int http_client_set_key(struct http_cli *cli, const char *path);
 int http_client_set_keypem(struct http_cli *cli, const char *pem);
+int http_client_use_chain(struct http_cli *cli, const char *path);
+int http_client_use_chainpem(struct http_cli *cli, const char *chain,
+			     int len_chain);
 
 int http_client_set_session_reuse(struct http_cli *cli, bool enabled);
 int http_client_set_tls_min_version(struct http_cli *cli, int version);
 int http_client_set_tls_max_version(struct http_cli *cli, int version);
+int http_client_disable_verify_server(struct http_cli *cli);
 #endif
 
 /* Server */
 struct http_sock;
 struct http_conn;
 
+enum re_https_verify_msg {
+	HTTPS_MSG_OK = 0,
+	HTTPS_MSG_REQUEST_CERT = 1,
+	HTTPS_MSG_IGNORE = 2,
+};
+
 typedef void (http_req_h)(struct http_conn *conn, const struct http_msg *msg,
 			  void *arg);
+typedef enum re_https_verify_msg (https_verify_msg_h)(struct http_conn *conn,
+	const struct http_msg *msg, void *arg);
 
+int http_listen_fd(struct http_sock **sockp, re_sock_t fd, http_req_h *reqh,
+		   void *arg);
 int  http_listen(struct http_sock **sockp, const struct sa *laddr,
 		 http_req_h *reqh, void *arg);
 int  https_listen(struct http_sock **sockp, const struct sa *laddr,
 		  const char *cert, http_req_h *reqh, void *arg);
+int  https_set_verify_msgh(struct http_sock *sock,
+			   https_verify_msg_h *verifyh);
 struct tcp_sock *http_sock_tcp(struct http_sock *sock);
+struct tls *http_sock_tls(const struct http_sock *conn);
 const struct sa *http_conn_peer(const struct http_conn *conn);
 struct tcp_conn *http_conn_tcp(struct http_conn *conn);
 struct tls_conn *http_conn_tls(struct http_conn *conn);
+
 void http_conn_reset_timeout(struct http_conn *conn);
 void http_conn_close(struct http_conn *conn);
 int  http_reply(struct http_conn *conn, uint16_t scode, const char *reason,

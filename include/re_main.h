@@ -7,6 +7,7 @@
 #include "re_async.h"
 
 struct re;
+struct re_fhs;
 
 enum {
 #ifndef FD_READ
@@ -35,13 +36,14 @@ typedef void (fd_h)(int flags, void *arg);
 typedef void (re_signal_h)(int sig);
 
 
-int   fd_listen(re_sock_t fd, int flags, fd_h *fh, void *arg);
-void  fd_close(re_sock_t fd);
+int   fd_listen(struct re_fhs **fhsp, re_sock_t fd, int flags, fd_h *fh,
+	void *arg);
+struct re_fhs *fd_close(struct re_fhs *fhs);
 int   fd_setsize(int maxfds);
-void  fd_debug(void);
 
 int   libre_init(void);
 void  libre_close(void);
+void  libre_exception_btrace(bool enable);
 
 int   re_main(re_signal_h *signalh);
 void  re_cancel(void);
@@ -56,18 +58,25 @@ int  re_thread_init(void);
 void re_thread_close(void);
 void re_thread_enter(void);
 void re_thread_leave(void);
-int  re_thread_check(void);
+int  re_thread_check(bool debug);
 int  re_thread_async_init(uint16_t workers);
 void re_thread_async_close(void);
 int  re_thread_async(re_async_work_h *work, re_async_h *cb, void *arg);
+int  re_thread_async_main(re_async_work_h *work, re_async_h *cb, void *arg);
+int  re_thread_async_id(intptr_t id, re_async_work_h *work, re_async_h *cb,
+		       void *arg);
+int re_thread_async_main_id(intptr_t id, re_async_work_h *work, re_async_h *cb,
+			    void *arg);
+void re_thread_async_cancel(intptr_t id);
+void re_thread_async_main_cancel(intptr_t id);
 
 void re_set_mutex(void *mutexp);
 
+struct tmrl *re_tmrl_get(void);
 
 /** Polling methods */
 enum poll_method {
 	METHOD_NULL = 0,
-	METHOD_POLL,
 	METHOD_SELECT,
 	METHOD_EPOLL,
 	METHOD_KQUEUE,

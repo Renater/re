@@ -28,12 +28,10 @@ static struct {
 	enum dbg_flags flags;  /**< Debug flags            */
 	dbg_print_h *ph;       /**< Optional print handler */
 	void *arg;             /**< Handler argument       */
-	FILE *f;               /**< Logfile                */
 } dbg = {
 	0,
 	DBG_INFO,
 	DBG_ANSI,
-	NULL,
 	NULL,
 	NULL,
 };
@@ -82,37 +80,6 @@ void dbg_init(int level, enum dbg_flags flags)
  */
 void dbg_close(void)
 {
-	if (dbg.f) {
-		(void)fclose(dbg.f);
-		dbg.f = NULL;
-	}
-}
-
-
-/**
- * Set debug logfile
- *
- * @param name Name of the logfile, NULL to close
- *
- * @return 0 if success, otherwise errorcode
- */
-int dbg_logfile_set(const char *name)
-{
-	int err;
-
-	dbg_close();
-
-	if (!name)
-		return 0;
-
-	err = fs_fopen(&dbg.f, name, "a+");
-	if (err)
-		return err;
-
-	(void)re_fprintf(dbg.f, "\n===== Log Started: %H", fmt_gmtime, NULL);
-	(void)fflush(dbg.f);
-
-	return 0;
 }
 
 
@@ -124,8 +91,10 @@ int dbg_logfile_set(const char *name)
  */
 void dbg_handler_set(dbg_print_h *ph, void *arg)
 {
+	dbg_lock();
 	dbg.ph  = ph;
 	dbg.arg = arg;
+	dbg_unlock();
 }
 
 
@@ -180,38 +149,28 @@ out:
 }
 
 
-/* Formatted output to print handler and/or logfile */
+/* Formatted output to print handler */
 static void dbg_fmt_vprintf(int level, const char *fmt, va_list ap)
 {
 	char buf[256];
-	int len;
 
 	dbg_lock();
+	int dbg_level   = dbg.level;
+	dbg_print_h *ph = dbg.ph;
+	void *arg       = dbg.arg;
+	dbg_unlock();
 
-	if (level > dbg.level)
-		goto out;
-
-	if (!dbg.ph && !dbg.f)
-		goto out;
-
-
-	len = re_vsnprintf(buf, sizeof(buf), fmt, ap);
-	if (len <= 0)
-		goto out;
+	if (level > dbg_level)
+		return;
 
 	/* Print handler? */
-	if (dbg.ph) {
-		dbg.ph(level, buf, len, dbg.arg);
-	}
+	if (ph) {
+		int len = re_vsnprintf(buf, sizeof(buf), fmt, ap);
+		if (len <= 0)
+			return;
 
-	/* Output to file */
-	if (dbg.f) {
-		if (fwrite(buf, 1, len, dbg.f) > 0)
-			(void)fflush(dbg.f);
+		ph(level, buf, len, arg);
 	}
-
- out:
-	dbg_unlock();
 }
 
 
@@ -231,74 +190,6 @@ void dbg_printf(int level, const char *fmt, ...)
 
 	va_start(ap, fmt);
 	dbg_fmt_vprintf(level, fmt, ap);
-	va_end(ap);
-}
-
-
-/**
- * Print a formatted debug message to /dev/null
- *
- * @param fmt   Formatted string
- */
-void dbg_noprintf(const char *fmt, ...)
-{
-	(void)fmt;
-}
-
-
-/**
- * Print a formatted warning message
- *
- * @param fmt   Formatted string
- */
-void dbg_warning(const char *fmt, ...)
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	dbg_vprintf(DBG_WARNING, fmt, ap);
-	va_end(ap);
-
-	va_start(ap, fmt);
-	dbg_fmt_vprintf(DBG_WARNING, fmt, ap);
-	va_end(ap);
-}
-
-
-/**
- * Print a formatted notice message
- *
- * @param fmt   Formatted string
- */
-void dbg_notice(const char *fmt, ...)
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	dbg_vprintf(DBG_NOTICE, fmt, ap);
-	va_end(ap);
-
-	va_start(ap, fmt);
-	dbg_fmt_vprintf(DBG_NOTICE, fmt, ap);
-	va_end(ap);
-}
-
-
-/**
- * Print a formatted info message
- *
- * @param fmt   Formatted string
- */
-void dbg_info(const char *fmt, ...)
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	dbg_vprintf(DBG_INFO, fmt, ap);
-	va_end(ap);
-
-	va_start(ap, fmt);
-	dbg_fmt_vprintf(DBG_INFO, fmt, ap);
 	va_end(ap);
 }
 

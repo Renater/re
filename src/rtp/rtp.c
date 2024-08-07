@@ -14,8 +14,8 @@
 #include <re_net.h>
 #include <re_udp.h>
 #include <re_rtp.h>
+#include <re_atomic.h>
 #include "rtcp.h"
-
 
 #define DEBUG_MODULE "rtp"
 #define DEBUG_LEVEL 5
@@ -38,7 +38,7 @@ struct rtp_sock {
 	rtcp_recv_h *rtcph;     /**< RTCP Receive handler  */
 	void *arg;              /**< Handler argument      */
 	struct rtcp_sess *rtcp; /**< RTCP Session          */
-	bool rtcp_mux;          /**< RTP/RTCP multiplexing */
+	RE_ATOMIC bool rtcp_mux;  /**< RTP/RTCP multiplexing */
 };
 
 
@@ -166,6 +166,10 @@ static void rtcp_recv_handler(const struct sa *src, struct mbuf *mb, void *arg)
 	struct rtp_sock *rs = arg;
 	struct rtcp_msg *msg;
 
+#ifdef RE_RTP_PCAP
+	re_text2pcap_trace("rtcp_recv", "RTCP", true, mb);
+#endif
+
 	while (0 == rtcp_decode(&msg, mb)) {
 
 		/* handle internally first */
@@ -187,7 +191,7 @@ static void udp_recv_handler(const struct sa *src, struct mbuf *mb, void *arg)
 	int err;
 
 	/* Handle RTCP multiplexed on RTP-port */
-	if (rs->rtcp_mux) {
+	if (re_atomic_rlx(&rs->rtcp_mux)) {
 		uint8_t pt;
 
 		if (mbuf_get_left(mb) < 2)
@@ -201,14 +205,17 @@ static void udp_recv_handler(const struct sa *src, struct mbuf *mb, void *arg)
 		}
 	}
 
+#ifdef RE_RTP_PCAP
+	re_text2pcap_trace("rtp_udp_recv", "RTP", true, mb);
+#endif
+
 	err = rtp_decode(rs, mb, &hdr);
 	if (err)
 		return;
 
-	if (rs->rtcp) {
-		rtcp_sess_rx_rtp(rs->rtcp, hdr.seq, hdr.ts,
-				 hdr.ssrc, mbuf_get_left(mb), src);
-	}
+
+	if (rs->rtcp)
+		rtcp_sess_rx_rtp(rs->rtcp, &hdr, mbuf_get_left(mb), src);
 
 	if (rs->recvh)
 		rs->recvh(src, &hdr, mb, rs->arg);
@@ -379,6 +386,43 @@ int rtp_open(struct rtp_sock **rsp, int af)
 
 
 /**
+ * Encode a new RTP header with sequence into the beginning of the buffer
+ *
+ * @param rs     RTP Socket
+ * @param seq    Sequence Number
+ * @param ext    Extension bit
+ * @param marker Marker bit
+ * @param pt     Payload type
+ * @param ts     Timestamp
+ * @param mb     Memory buffer
+ *
+ * @return 0 for success, otherwise errorcode
+ *
+ * @note The buffer must have enough space for the RTP header
+ */
+int rtp_encode_seq(struct rtp_sock *rs, uint16_t seq, bool ext, bool marker,
+		   uint8_t pt, uint32_t ts, struct mbuf *mb)
+{
+	struct rtp_header hdr;
+
+	if (!rs || pt&~0x7f || !mb)
+		return EINVAL;
+
+	hdr.ver  = RTP_VERSION;
+	hdr.pad  = false;
+	hdr.ext  = ext;
+	hdr.cc   = 0;
+	hdr.m    = marker ? 1 : 0;
+	hdr.pt   = pt;
+	hdr.seq  = seq;
+	hdr.ts   = ts;
+	hdr.ssrc = rs->enc.ssrc;
+
+	return rtp_hdr_encode(mb, &hdr);
+}
+
+
+/**
  * Encode a new RTP header into the beginning of the buffer
  *
  * @param rs     RTP Socket
@@ -406,7 +450,7 @@ int rtp_encode(struct rtp_sock *rs, bool ext, bool marker, uint8_t pt,
 	hdr.cc   = 0;
 	hdr.m    = marker ? 1 : 0;
 	hdr.pt   = pt;
-	hdr.seq  = rs->enc.seq++;
+	hdr.seq  = ++rs->enc.seq;
 	hdr.ts   = ts;
 	hdr.ssrc = rs->enc.ssrc;
 
@@ -489,6 +533,58 @@ int rtp_send(struct rtp_sock *rs, const struct sa *dst, bool ext,
 
 	mb->pos = pos;
 
+#ifdef RE_RTP_PCAP
+	re_text2pcap_trace("rtp_send", "RTP", false, mb);
+#endif
+
+	return udp_send(rs->sock_rtp, dst, mb);
+}
+
+
+/**
+ * Resend an RTP packet to a peer (no rtcp update)
+ *
+ * @param rs     RTP Socket
+ * @param seq    Sequence Number
+ * @param dst    Destination address
+ * @param ext    Extension bit
+ * @param marker Marker bit
+ * @param pt     Payload type
+ * @param ts     Timestamp
+ * @param mb     Payload buffer
+ *
+ * @return 0 for success, otherwise errorcode
+ */
+int rtp_resend(struct rtp_sock *rs, uint16_t seq, const struct sa *dst,
+	       bool ext, bool marker, uint8_t pt, uint32_t ts, struct mbuf *mb)
+{
+	size_t pos;
+	int err;
+
+	if (!rs || !mb)
+		return EINVAL;
+
+	if (mb->pos < RTP_HEADER_SIZE) {
+		DEBUG_WARNING("rtp_resend: buffer must have space for"
+			      " rtp header (pos=%u, end=%u)\n",
+			      mb->pos, mb->end);
+		return EBADMSG;
+	}
+
+	mbuf_advance(mb, -RTP_HEADER_SIZE);
+
+	pos = mb->pos;
+
+	err = rtp_encode_seq(rs, seq, ext, marker, pt, ts, mb);
+	if (err)
+		return err;
+
+	mb->pos = pos;
+
+#ifdef RE_RTP_PCAP
+	re_text2pcap_trace("rtp_resend", "RTP", false, mb);
+#endif
+
 	return udp_send(rs->sock_rtp, dst, mb);
 }
 
@@ -546,6 +642,19 @@ uint32_t rtp_sess_ssrc(const struct rtp_sock *rs)
 
 
 /**
+ * Get the last Sequence number from an RTP/RTCP Socket
+ *
+ * @param rs RTP Socket
+ *
+ * @return Sequence number
+ */
+uint16_t rtp_sess_seq(const struct rtp_sock *rs)
+{
+	return rs ? rs->enc.seq : 0;
+}
+
+
+/**
  * Get the RTCP-Session for an RTP/RTCP Socket
  *
  * @param rs RTP Socket
@@ -589,7 +698,7 @@ void rtcp_enable_mux(struct rtp_sock *rs, bool enabled)
 	if (!rs)
 		return;
 
-	rs->rtcp_mux = enabled;
+	re_atomic_rlx_set(&rs->rtcp_mux, enabled);
 }
 
 
@@ -603,11 +712,18 @@ void rtcp_enable_mux(struct rtp_sock *rs, bool enabled)
  */
 int rtcp_send(struct rtp_sock *rs, struct mbuf *mb)
 {
-	if (!rs || !rs->sock_rtcp || !sa_isset(&rs->rtcp_peer, SA_ALL))
+	void* sock;
+	if (!rs)
 		return EINVAL;
 
-	return udp_send(rs->rtcp_mux ? rs->sock_rtp : rs->sock_rtcp,
-			&rs->rtcp_peer, mb);
+	sock = re_atomic_rlx(&rs->rtcp_mux) ? rs->sock_rtp : rs->sock_rtcp;
+	if (!sock || !sa_isset(&rs->rtcp_peer, SA_ALL))
+		return EINVAL;
+
+#ifdef RE_RTP_PCAP
+	re_text2pcap_trace("rtcp_send", "RTCP", false, mb);
+#endif
+	return udp_send(sock, &rs->rtcp_peer, mb);
 }
 
 
@@ -645,7 +761,7 @@ int rtp_debug(struct re_printf *pf, const struct rtp_sock *rs)
 		return EINVAL;
 
 	err  = re_hprintf(pf, "RTP debug:\n");
-	err |= re_hprintf(pf, " Encode: seq=%u ssrc=0x%lx\n",
+	err |= re_hprintf(pf, " Encode: seq=%u ssrc=0x%x\n",
 			  rs->enc.seq, rs->enc.ssrc);
 
 	if (rs->rtcp)

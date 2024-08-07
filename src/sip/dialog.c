@@ -34,8 +34,11 @@ struct sip_dialog {
 	uint32_t hash;
 	uint32_t lseq;
 	uint32_t rseq;
+	uint32_t lseqinv;
 	size_t cpos;
+	size_t rpos;
 	enum sip_transp tp;
+	uint32_t srcport;
 };
 
 
@@ -117,6 +120,7 @@ int sip_dialog_alloc(struct sip_dialog **dlgp,
 		if (i == 0)
 			rend = dlg->mb->pos - 2;
 	}
+	dlg->rpos = dlg->mb->pos;
 	err |= mbuf_printf(dlg->mb, "To: <%s>\r\n", to_uri);
 	dlg->cpos = dlg->mb->pos;
 	err |= mbuf_printf(dlg->mb, "From: %s%s%s<%s>;tag=%016llx\r\n",
@@ -230,7 +234,9 @@ int sip_dialog_accept(struct sip_dialog **dlgp, const struct sip_msg *msg)
 
 	err |= sip_msg_hdr_apply(msg, true, SIP_HDR_RECORD_ROUTE,
 				 record_route_handler, &renc) ? ENOMEM : 0;
+	dlg->rpos = dlg->mb->pos;
 	err |= mbuf_printf(dlg->mb, "To: %r\r\n", &msg->from.val);
+	dlg->cpos = dlg->mb->pos;
 	err |= mbuf_printf(dlg->mb, "From: %r;tag=%016llx\r\n", &msg->to.val,
 			   msg->tag);
 	if (err)
@@ -303,10 +309,12 @@ int sip_dialog_create(struct sip_dialog *dlg, const struct sip_msg *msg)
 
 	err |= sip_msg_hdr_apply(msg, msg->req, SIP_HDR_RECORD_ROUTE,
 				 record_route_handler, &renc) ? ENOMEM : 0;
+	dlg->rpos = renc.mb->pos;
 	err |= mbuf_printf(renc.mb, "To: %r\r\n",
 			   msg->req ? &msg->from.val : &msg->to.val);
 
 	dlg->mb->pos = dlg->cpos;
+	dlg->cpos = renc.mb->pos;
 	err |= mbuf_write_mem(renc.mb, mbuf_buf(dlg->mb),
 			      mbuf_get_left(dlg->mb));
 	dlg->mb->pos = 0;
@@ -343,7 +351,6 @@ int sip_dialog_create(struct sip_dialog *dlg, const struct sip_msg *msg)
 	dlg->rtag = mem_ref(rtag);
 	dlg->uri  = mem_ref(uri);
 	dlg->rseq = msg->req ? msg->cseq.num : 0;
-	dlg->cpos = 0;
 	dlg->tp   = msg->tp;
 
  out:
@@ -389,12 +396,13 @@ int sip_dialog_fork(struct sip_dialog **dlgp, struct sip_dialog *odlg,
 	if (!dlg)
 		return ENOMEM;
 
-	dlg->callid = mem_ref(odlg->callid);
-	dlg->ltag   = mem_ref(odlg->ltag);
-	dlg->hash   = odlg->hash;
-	dlg->lseq   = odlg->lseq;
-	dlg->rseq   = msg->req ? msg->cseq.num : 0;
-	dlg->tp     = msg->tp;
+	dlg->callid  = mem_ref(odlg->callid);
+	dlg->ltag    = mem_ref(odlg->ltag);
+	dlg->hash    = odlg->hash;
+	dlg->lseq    = odlg->lseq;
+	dlg->lseqinv = odlg->lseqinv;
+	dlg->rseq    = msg->req ? msg->cseq.num : 0;
+	dlg->tp      = msg->tp;
 
 	err = pl_strdup(&dlg->uri, &addr.auri);
 	if (err)
@@ -461,6 +469,9 @@ int sip_dialog_update(struct sip_dialog *dlg, const struct sip_msg *msg)
 {
 	const struct sip_hdr *contact;
 	struct sip_addr addr;
+	struct mbuf *mb;
+	struct pl pl;
+	size_t cpos;
 	char *uri;
 	int err;
 
@@ -478,10 +489,34 @@ int sip_dialog_update(struct sip_dialog *dlg, const struct sip_msg *msg)
 	if (err)
 		return err;
 
+	mb = mbuf_alloc(512);
+	if (!mb)
+		return ENOMEM;
+
+	err = mbuf_write_mem(mb, mbuf_buf(dlg->mb), dlg->rpos);
+	err |= mbuf_printf(mb, "To: %r\r\n",
+		   msg->req ? &msg->from.val : &msg->to.val);
+	cpos = mb->pos;
+	err |= mbuf_write_mem(mb, mbuf_buf(dlg->mb) + dlg->cpos,
+			      mbuf_get_left(dlg->mb) - dlg->cpos);
+
+	if (err)
+		goto out;
+
+	dlg->cpos = cpos;
+	mb->pos = 0;
+
+	mem_deref(dlg->rtag);
+	err = pl_strdup(&dlg->rtag, msg->req ? &msg->from.tag : &msg->to.tag);
+	if (err)
+		return err;
+
+	mem_deref(dlg->mb);
+	dlg->mb = mem_ref(mb);
+
 	if (dlg->route.scheme.p == dlg->uri) {
 
 		struct uri tmp;
-		struct pl pl;
 
 		pl_set_str(&pl, uri);
 		err = uri_decode(&tmp, &pl);
@@ -490,11 +525,17 @@ int sip_dialog_update(struct sip_dialog *dlg, const struct sip_msg *msg)
 
 		dlg->route = tmp;
 	}
+	else {
+		pl.p = (const char *)mbuf_buf(dlg->mb) + ROUTE_OFFSET;
+		pl.l = dlg->rpos - ROUTE_OFFSET;
+		err = sip_addr_decode(&addr, &pl);
+		dlg->route = addr.uri;
+	}
 
 	mem_deref(dlg->uri);
 	dlg->uri = mem_ref(uri);
-
  out:
+	mem_deref(mb);
 	mem_deref(uri);
 
 	return err;
@@ -530,6 +571,9 @@ int sip_dialog_encode(struct mbuf *mb, struct sip_dialog *dlg, uint32_t cseq,
 
 	if (!mb || !dlg || !met)
 		return EINVAL;
+
+	if (!strcmp(met, "INVITE"))
+		dlg->lseqinv = dlg->lseq;
 
 	err |= mbuf_write_mem(mb, mbuf_buf(dlg->mb), mbuf_get_left(dlg->mb));
 	err |= mbuf_printf(mb, "Call-ID: %s\r\n", dlg->callid);
@@ -579,6 +623,37 @@ int sip_dialog_set_callid(struct sip_dialog *dlg, const char *callid)
 
 
 /**
+ * Set TCP source port for a SIP Dialog
+ *
+ * @param dlg  SIP Dialog
+ * @param srcport The TCP source port to be used
+ */
+void sip_dialog_set_srcport(struct sip_dialog *dlg, uint16_t srcport)
+{
+	if (!dlg)
+		return;
+
+	dlg->srcport = srcport;
+}
+
+
+/**
+ * Get TCP source port for a SIP Dialog
+ *
+ * @param dlg  SIP Dialog
+ *
+ * @return TCP source port
+ */
+uint16_t sip_dialog_srcport(struct sip_dialog *dlg)
+{
+	if (!dlg)
+		return 0;
+
+	return dlg->srcport;
+}
+
+
+/**
  * Get the local sequence number from a SIP Dialog
  *
  * @param dlg SIP Dialog
@@ -588,6 +663,19 @@ int sip_dialog_set_callid(struct sip_dialog *dlg, const char *callid)
 uint32_t sip_dialog_lseq(const struct sip_dialog *dlg)
 {
 	return dlg ? dlg->lseq : 0;
+}
+
+
+/**
+ * Get the local sequence number of the last sent INVITE
+ *
+ * @param dlg SIP Dialog
+ *
+ * @return Local sequence number
+ */
+uint32_t sip_dialog_lseqinv(const struct sip_dialog *dlg)
+{
+	return dlg ? dlg->lseqinv : 0;
 }
 
 

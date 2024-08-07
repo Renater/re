@@ -4,6 +4,7 @@
  * Copyright (C) 2011 Creytiv.com
  */
 
+#include <string.h>
 #include <re_types.h>
 #include <re_mem.h>
 #include <re_mbuf.h>
@@ -29,6 +30,7 @@ struct http_sock {
 	struct tcp_sock *ts;
 	struct tls *tls;
 	http_req_h *reqh;
+	https_verify_msg_h *verifyh;
 	void *arg;
 };
 
@@ -40,6 +42,7 @@ struct http_conn {
 	struct tcp_conn *tc;
 	struct tls_conn *sc;
 	struct mbuf *mb;
+	struct tmr verify_cert_tmr;
 };
 
 
@@ -94,6 +97,109 @@ static void timeout_handler(void *arg)
 
 	conn_close(conn);
 	mem_deref(conn);
+}
+
+
+struct http_verify_msg_d {
+	struct http_conn *conn;
+	struct http_msg *msg;
+	int err;
+	int scode;
+	const char *reason;
+};
+
+
+static void verify_msg_destructor(void *arg)
+{
+	struct http_verify_msg_d *d = arg;
+	mem_deref(d->msg);
+}
+
+
+static void verify_cert_done(void *arg)
+{
+	struct http_verify_msg_d *d = arg;
+
+	if (d->err)
+		http_ereply(d->conn, d->scode, d->reason);
+	else
+		d->conn->sock->reqh(d->conn, d->msg, d->conn->sock->arg);
+
+	mem_deref(arg);
+}
+
+
+#ifdef USE_TLS
+static int http_verify_handler(int ok, void *arg)
+{
+	struct http_verify_msg_d *d = arg;
+
+	if (ok) {
+		d->err = 0;
+	}
+	else {
+		d->err = EACCES;
+		d->scode = 403;
+		d->reason = "Forbidden";
+	}
+
+	tmr_start(&d->conn->verify_cert_tmr, 1, verify_cert_done, d);
+
+	return ok;
+}
+#endif
+
+
+static enum re_https_verify_msg verify_msg(struct http_conn *conn,
+	struct http_msg *msg)
+{
+	enum re_https_verify_msg res;
+	struct http_verify_msg_d *d;
+
+	if (!conn->sock)
+		return HTTPS_MSG_IGNORE;
+	else if (!conn->sock->verifyh)
+		return HTTPS_MSG_OK;
+
+	res = conn->sock->verifyh(conn, msg, conn->sock->arg);
+
+	if (res == HTTPS_MSG_REQUEST_CERT) {
+
+		d = mem_zalloc(sizeof(*d), verify_msg_destructor);
+		if (!d) {
+			res = HTTPS_MSG_IGNORE;
+			goto out;
+		}
+
+		d->conn = conn;
+		d->err = ETIMEDOUT;
+		d->scode = 408;
+		d->reason = "Request Timeout";
+		d->msg = msg;
+
+		tmr_init(&conn->verify_cert_tmr);
+		tmr_start(&conn->verify_cert_tmr, TIMEOUT_IDLE,
+			verify_cert_done, d);
+
+#ifdef USE_TLS
+		int err = tls_set_verify_client_handler(http_conn_tls(conn),
+			-1, http_verify_handler, d);
+		if (err) {
+			res = HTTPS_MSG_IGNORE;
+			goto out;
+		}
+
+		err = tls_verify_client_post_handshake(
+				http_conn_tls(conn));
+		if (err) {
+			res = HTTPS_MSG_IGNORE;
+			goto out;
+		}
+#endif
+	}
+
+out:
+	return res;
 }
 
 
@@ -171,10 +277,10 @@ static void recv_handler(struct mbuf *mb, void *arg)
 			conn->mb = mem_deref(conn->mb);
 		}
 
-		if (conn->sock)
+		if (verify_msg(conn, msg) == HTTPS_MSG_OK) {
 			conn->sock->reqh(conn, msg, conn->sock->arg);
-
-		mem_deref(msg);
+			mem_deref(msg);
+		}
 
 		if (!conn->tc) {
 			err = ENOTCONN;
@@ -238,6 +344,46 @@ static void connect_handler(const struct sa *peer, void *arg)
 		mem_deref(conn);
 		tcp_reject(sock->ts);
 	}
+}
+
+
+/**
+ * Create an HTTP socket from file descriptor
+ *
+ * @param sockp Pointer to returned HTTP Socket
+ * @param fd    File descriptor
+ * @param reqh  Request handler
+ * @param arg   Handler argument
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int http_listen_fd(struct http_sock **sockp, re_sock_t fd, http_req_h *reqh,
+		   void *arg)
+{
+	struct http_sock *sock;
+	int err;
+
+	if (!sockp || fd == RE_BAD_SOCK || !reqh)
+		return EINVAL;
+
+	sock = mem_zalloc(sizeof(*sock), sock_destructor);
+	if (!sock)
+		return ENOMEM;
+
+	err = tcp_sock_alloc_fd(&sock->ts, fd, connect_handler, sock);
+	if (err)
+		goto out;
+
+	sock->reqh = reqh;
+	sock->arg  = arg;
+
+out:
+	if (err)
+		mem_deref(sock);
+	else
+		*sockp = sock;
+
+	return err;
 }
 
 
@@ -324,6 +470,33 @@ int https_listen(struct http_sock **sockp, const struct sa *laddr,
 
 
 /**
+ * Set verify http msg handler.
+ *
+ * This handler allows to decide whether e.g. a certificate
+ * should be requested from the client or not.
+ * E.g. This decision can done based on the http path contained in
+ * struct http_msg.
+ *
+ * @param sock 		HTTP socket
+ * @param verifyh 	Verify handler called before the https request
+ *                      handler is called to return a http response
+ *                      to the client.
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int  https_set_verify_msgh(struct http_sock *sock,
+	https_verify_msg_h *verifyh)
+{
+	if (!sock || !verifyh)
+		return EINVAL;
+
+	sock->verifyh = verifyh;
+
+	return 0;
+}
+
+
+/**
  * Get the TCP socket of an HTTP socket
  *
  * @param sock HTTP socket
@@ -333,6 +506,19 @@ int https_listen(struct http_sock **sockp, const struct sa *laddr,
 struct tcp_sock *http_sock_tcp(struct http_sock *sock)
 {
 	return sock ? sock->ts : NULL;
+}
+
+
+/**
+ * Get the TLS struct of an HTTP sock
+ *
+ * @param sock HTTP socket
+ *
+ * @return TLS struct
+ */
+struct tls *http_sock_tls(const struct http_sock *sock)
+{
+	return sock ? sock->tls : NULL;
 }
 
 

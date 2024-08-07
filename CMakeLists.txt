@@ -3,6 +3,7 @@
 #
 # Copyright (C) 2010 - 2022 Alfred E. Heggestad
 # Copyright (C) 2022 Sebastian Reimers
+# Copyright (C) 2023 Christian Spielberger
 #
 
 ##############################################################################
@@ -10,16 +11,16 @@
 # Versioning
 #
 
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
 
 project(re
-  VERSION 2.10.0
+  VERSION 3.14.0
   LANGUAGES C
   HOMEPAGE_URL https://github.com/baresip/re
   DESCRIPTION "Generic library for real-time communications"
 )
 
-set(PROJECT_SOVERSION 12) # bump if ABI breaks
+set(PROJECT_SOVERSION 26) # bump if ABI breaks
 
 # Pre-release identifier, comment out on a release
 # Increment for breaking changes (dev2, dev3...)
@@ -31,6 +32,10 @@ else()
   set(PROJECT_VERSION_FULL ${PROJECT_VERSION})
 endif()
 
+if(WIN32 AND NOT MINGW)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std:c11")
+endif()
+
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/cmake)
 
 ##############################################################################
@@ -38,21 +43,22 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/cmake)
 # Module/Package Includes
 #
 include(GNUInstallDirs)
+include(CheckCCompilerFlag)
 
 ##############################################################################
 #
 # Options
 #
 
+option(USE_REM "Enable Librem" ON)
 option(USE_BFCP "Enable BFCP" ON)
-option(USE_JBUF "Enable JBUF" ON)
 option(USE_PCP "Enable PCP" ON)
 option(USE_RTMP "Enable RTMP" ON)
 option(USE_SIP "Enable SIP" ON)
+option(LIBRE_BUILD_SHARED "Build shared library" ON)
+option(LIBRE_BUILD_STATIC "Build static library" ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_EXTENSIONS OFF)
 
 if(MSVC)
   add_compile_options("/W3")
@@ -76,7 +82,15 @@ else()
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wshorten-64-to-32 -Watomic-implicit-seq-cst)
+    add_compile_options(
+      -Wshorten-64-to-32
+      -Wno-gnu-zero-variadic-macro-arguments
+    )
+endif()
+
+check_c_compiler_flag("-Watomic-implicit-seq-cst" COMPILER_SUPPORTS_WATOMIC)
+if(COMPILER_SUPPORTS_WATOMIC)
+  add_compile_options(-Watomic-implicit-seq-cst)
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
@@ -85,13 +99,14 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang")
 endif()
 
 set(re_DIR ${CMAKE_CURRENT_LIST_DIR}/cmake)
-find_package(re CONFIG REQUIRED)
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/re-config.cmake")
 
 list(APPEND RE_DEFINITIONS
-  -DVERSION="${PROJECT_VERSION_FULL}"
+  -DRE_VERSION="${PROJECT_VERSION_FULL}"
   -DVER_MAJOR=${PROJECT_VERSION_MAJOR}
   -DVER_MINOR=${PROJECT_VERSION_MINOR}
   -DVER_PATCH=${PROJECT_VERSION_PATCH}
+  -D_GNU_SOURCE
 )
 
 if(DEFINED TRACE_SSL)
@@ -117,6 +132,7 @@ set(HEADERS
   include/re_convert.h
   include/re_crc32.h
   include/re_dbg.h
+  include/re_dd.h
   include/re_dns.h
   include/re_fmt.h
   include/re_h264.h
@@ -126,7 +142,6 @@ set(HEADERS
   include/re_http.h
   include/re_httpauth.h
   include/re_ice.h
-  include/re_jbuf.h
   include/re_json.h
   include/re_list.h
   include/re_main.h
@@ -165,7 +180,36 @@ set(HEADERS
   include/re_udp.h
   include/re_uri.h
   include/re_websock.h
+  include/rem_aac.h
+  include/rem_aubuf.h
+  include/rem_auconv.h
+  include/rem_audio.h
+  include/rem_aufile.h
+  include/rem_auframe.h
+  include/rem_au.h
+  include/rem_aulevel.h
+  include/rem_aumix.h
+  include/rem_auresamp.h
+  include/rem_autone.h
+  include/rem_avc.h
+  include/rem_dsp.h
+  include/rem_dtmf.h
+  include/rem_fir.h
+  include/rem_flv.h
+  include/rem_g711.h
+  include/rem_goertzel.h
+  include/rem.h
+  include/rem_vidconv.h
+  include/rem_video.h
+  include/rem_vid.h
+  include/rem_vidmix.h
 )
+
+if(USE_UNIXSOCK)
+  list(APPEND HEADERS
+    include/re_unixsock.h
+  )
+endif()
 
 set(SRCS
 
@@ -183,6 +227,10 @@ set(SRCS
 
   src/dbg/dbg.c
 
+  src/dd/dd.c
+  src/dd/dd_enc.c
+  src/dd/putbit.c
+
   src/dns/client.c
   src/dns/cstr.c
   src/dns/dname.c
@@ -199,6 +247,7 @@ set(SRCS
   src/fmt/regex.c
   src/fmt/str.c
   src/fmt/str_error.c
+  src/fmt/text2pcap.c
   src/fmt/time.c
   src/fmt/unicode.c
 
@@ -358,6 +407,37 @@ set(SRCS
   src/websock/websock.c
 )
 
+set(REM_SRCS
+  rem/aac/aac.c
+  rem/au/fmt.c
+  rem/au/util.c
+  rem/aubuf/aubuf.c
+  rem/aubuf/ajb.c
+  rem/auconv/auconv.c
+  rem/aufile/aufile.c
+  rem/aufile/wave.c
+  rem/auframe/auframe.c
+  rem/aulevel/aulevel.c
+  rem/aumix/aumix.c
+  rem/auresamp/resamp.c
+  rem/autone/tone.c
+  rem/avc/config.c
+  rem/dtmf/dec.c
+  rem/fir/fir.c
+  rem/g711/g711.c
+  rem/goertzel/goertzel.c
+  rem/vid/draw.c
+  rem/vid/fmt.c
+  rem/vid/frame.c
+  rem/vidconv/vconv.c
+  rem/vidmix/vidmix.c
+)
+
+if(USE_UNIXSOCK)
+  list(APPEND SRCS
+    src/unixsock/unixsock.c
+  )
+endif()
 
 if(USE_BFCP)
   list(APPEND SRCS
@@ -366,13 +446,6 @@ if(USE_BFCP)
     src/bfcp/msg.c
     src/bfcp/reply.c
     src/bfcp/request.c
-  )
-endif()
-
-
-if(USE_JBUF)
-  list(APPEND SRCS
-    src/jbuf/jbuf.c
   )
 endif()
 
@@ -454,7 +527,19 @@ if(USE_OPENSSL)
     src/tls/openssl/tls_tcp.c
     src/tls/openssl/tls_udp.c
     src/tls/openssl/tls.c
+    src/tls/openssl/sni.c
     src/hmac/openssl/hmac.c
+  )
+elseif(APPLE)
+  list(APPEND SRCS
+    src/aes/apple/aes.c
+    src/hmac/apple/hmac.c
+  )
+else()
+  list(APPEND SRCS
+    src/aes/stub.c
+    src/hmac/hmac.c
+    src/tls/stub.c
   )
 endif()
 
@@ -494,9 +579,27 @@ else()
   )
 endif()
 
+if(HAVE_RESOLV)
+  list(APPEND SRCS
+    src/dns/res.c
+  )
+endif()
+
 if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
   list(APPEND SRCS
     src/dns/darwin/srv.c
+    src/net/bsd/brt.c
+  )
+elseif(${CMAKE_SYSTEM_NAME} MATCHES "iOS")
+  list(APPEND SRCS
+    src/dns/darwin/srv.c
+  )
+elseif(${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD")
+  list(APPEND SRCS
+    src/net/bsd/brt.c
+  )
+elseif(${CMAKE_SYSTEM_NAME} MATCHES "OpenBSD")
+  list(APPEND SRCS
     src/net/bsd/brt.c
   )
 elseif(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
@@ -509,45 +612,8 @@ elseif(${CMAKE_SYSTEM_NAME} MATCHES "Android")
   )
 endif()
 
-
-##############################################################################
-#
-# Linking LIBS
-#
-
-set(LINKLIBS Threads::Threads)
-
-if(BACKTRACE_FOUND)
-  list(APPEND LINKLIBS ${Backtrace_LIBRARIES})
-endif()
-
-if(ZLIB_FOUND)
-  list(APPEND LINKLIBS ZLIB::ZLIB)
-endif()
-
-if(USE_OPENSSL)
-  list(APPEND LINKLIBS OpenSSL::SSL OpenSSL::Crypto)
-endif()
-
-if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
-  list(APPEND LINKLIBS
-    "-framework SystemConfiguration" "-framework CoreFoundation"
-  )
-endif()
-
-if(WIN32)
-  list(APPEND LINKLIBS
-    qwave
-    iphlpapi
-    wsock32
-    ws2_32
-  )
-endif()
-
-if(UNIX)
-  list(APPEND LINKLIBS
-    ${CMAKE_DL_LIBS}
-  )
+if(USE_REM)
+  list(APPEND SRCS ${REM_SRCS})
 endif()
 
 
@@ -562,8 +628,8 @@ set_target_properties(re-objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_compile_definitions(re-objs PRIVATE ${RE_DEFINITIONS})
 
-target_include_directories(re-objs PRIVATE .)
-target_include_directories(re-objs PRIVATE include
+target_include_directories(re-objs PRIVATE include)
+target_include_directories(re-objs PRIVATE
   ${OPENSSL_INCLUDE_DIR} ${ZLIB_INCLUDE_DIRS})
 
 
@@ -572,12 +638,16 @@ target_include_directories(re-objs PRIVATE include
 # Shared target libre.[so|dll|dylib]
 #
 
-add_library(re-shared SHARED $<TARGET_OBJECTS:re-objs>)
-target_link_libraries(re-shared PRIVATE ${LINKLIBS})
-set_target_properties(re-shared PROPERTIES VERSION
-  ${PROJECT_SOVERSION}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH})
-set_target_properties(re-shared PROPERTIES SOVERSION ${PROJECT_SOVERSION})
-set_target_properties(re-shared PROPERTIES OUTPUT_NAME "re")
+if(LIBRE_BUILD_SHARED)
+  list(APPEND RE_INSTALL_TARGETS re-shared)
+  add_library(re-shared SHARED $<TARGET_OBJECTS:re-objs>)
+  target_link_libraries(re-shared PRIVATE ${RE_LIBS})
+  set_target_properties(re-shared PROPERTIES VERSION
+    ${PROJECT_SOVERSION}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH})
+  set_target_properties(re-shared PROPERTIES SOVERSION ${PROJECT_SOVERSION})
+  set_target_properties(re-shared PROPERTIES OUTPUT_NAME "re")
+  add_library(libre::re-shared ALIAS re-shared)
+endif()
 
 
 ##############################################################################
@@ -585,15 +655,22 @@ set_target_properties(re-shared PROPERTIES OUTPUT_NAME "re")
 # Static target libre.a
 #
 
-add_library(re STATIC $<TARGET_OBJECTS:re-objs>)
-target_link_libraries(re PUBLIC ${LINKLIBS})
-target_include_directories(re PUBLIC include)
-set_target_properties(re PROPERTIES PUBLIC_HEADER "${HEADERS}")
+if(LIBRE_BUILD_STATIC)
+  list(APPEND RE_INSTALL_TARGETS re)
+  add_library(re STATIC $<TARGET_OBJECTS:re-objs>)
+  target_link_libraries(re PRIVATE ${RE_LIBS})
+  target_include_directories(re PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  add_library(libre::re ALIAS re)
 
-if(MSVC)
-set_target_properties(re PROPERTIES OUTPUT_NAME "re-static")
+  if(MSVC)
+    set_target_properties(re PROPERTIES OUTPUT_NAME "re-static")
+    if(NOT LIBRE_BUILD_SHARED)
+      set(PC_LIBNAME "re-static")
+    endif()
+  endif()
 endif()
-
 
 ##############################################################################
 #
@@ -604,6 +681,28 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_subdirectory(packaging)
 endif()
 
+if(NOT PC_LIBNAME)
+  set(PC_LIBNAME "re")
+endif()
+set(PC_REQUIRES "")
+set(PC_LINKLIBS "")
+foreach(item IN LISTS RE_LIBS)
+  if(item STREQUAL "Threads::Threads")
+    list(APPEND PC_LINKLIBS ${CMAKE_THREADS_LIBS_INIT})
+  elseif(item STREQUAL "OpenSSL::Crypto")
+    list(APPEND PC_REQUIRES "libcrypto")
+  elseif(item STREQUAL "OpenSSL::SSL")
+    list(APPEND PC_REQUIRES "libssl")
+  elseif(item STREQUAL "ZLIB::ZLIB")
+    list(APPEND PC_REQUIRES "zlib")
+  elseif(item MATCHES "^-|/")
+    list(APPEND PC_LINKLIBS "${item}")
+  else()
+    list(APPEND PC_LINKLIBS "-l${item}")
+  endif()
+endforeach()
+list(JOIN PC_LINKLIBS " " PC_LINKLIBS)
+list(JOIN PC_REQUIRES " " PC_REQUIRES)
 configure_file(packaging/libre.pc.in libre.pc @ONLY)
 
 
@@ -612,7 +711,12 @@ configure_file(packaging/libre.pc.in libre.pc @ONLY)
 # Install section
 #
 
-install(TARGETS re-shared re
+
+install(TARGETS ${RE_INSTALL_TARGETS}
+  EXPORT libre
+  RUNTIME
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+    COMPONENT Libraries
   LIBRARY
     DESTINATION ${CMAKE_INSTALL_LIBDIR}
     COMPONENT Libraries
@@ -620,20 +724,40 @@ install(TARGETS re-shared re
   ARCHIVE
     DESTINATION ${CMAKE_INSTALL_LIBDIR}
     COMPONENT Development
-  PUBLIC_HEADER
+  INCLUDES
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/re
-    COMPONENT Development
 )
 
-install(TARGETS re-shared
-  LIBRARY
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    NAMELINK_ONLY
-    COMPONENT Development
+install(FILES ${HEADERS}
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/re
+  COMPONENT Development
 )
+
+install(EXPORT libre
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libre
+  FILE libre-targets.cmake
+  NAMESPACE libre::
+  COMPONENT Development
+)
+
+if(LIBRE_BUILD_SHARED)
+  install(TARGETS re-shared
+    LIBRARY
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      NAMELINK_ONLY
+      COMPONENT Development
+  )
+endif()
 
 install(FILES cmake/re-config.cmake
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/re
+  COMPONENT Development
+)
+
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/libre-config.cmake"
+  "${CMAKE_CURRENT_BINARY_DIR}/cmake/libre-config.cmake" @ONLY)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/cmake/libre-config.cmake"
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libre
   COMPONENT Development
 )
 
@@ -641,3 +765,10 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libre.pc
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
   COMPONENT Development
 )
+
+
+##############################################################################
+# Test
+#
+
+add_subdirectory(test EXCLUDE_FROM_ALL)

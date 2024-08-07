@@ -49,7 +49,7 @@ static bool expr_match(const struct chr *chrv, uint32_t n, uint8_t c,
  * Example:
  *
  *   We parse the buffer for any numerical values, to get a match we must have
- *   1 or more occurences of the digits 0-9. The result is stored in 'num',
+ *   1 or more occurrences of the digits 0-9. The result is stored in 'num',
  *   which is of pointer-length type and will point to the first location in
  *   the buffer that contains "42".
  *
@@ -238,7 +238,7 @@ int re_regex(const char *ptr, size_t len, const char *expr, ...)
 		}
 
 	chr:
-		if (n >= ARRAY_SIZE(chrv))
+		if (n >= RE_ARRAY_SIZE(chrv))
 			break;
 
 		chrv[n].max = tolower(*ep);

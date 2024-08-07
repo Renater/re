@@ -15,6 +15,7 @@
 #include <re_msg.h>
 #include <re_sip.h>
 #include <re_sipsess.h>
+#include <re_sys.h>
 #include "sipsess.h"
 
 
@@ -28,8 +29,6 @@ static void destructor(void *arg)
 	mem_deref(sock->ht_sess);
 	hash_flush(sock->ht_ack);
 	mem_deref(sock->ht_ack);
-	hash_flush(sock->ht_prack);
-	mem_deref(sock->ht_prack);
 }
 
 
@@ -130,14 +129,13 @@ static void bye_handler(struct sipsess_sock *sock, const struct sip_msg *msg)
 static void ack_handler(struct sipsess_sock *sock, const struct sip_msg *msg)
 {
 	struct sipsess *sess;
-	bool awaiting_answer;
 	int err = 0;
 
 	sess = sipsess_find(sock, msg);
 	if (!sess)
 		return;
 
-	if (sipsess_reply_ack(sess, msg, &awaiting_answer))
+	if (sipsess_reply_ack(sess, msg))
 		return;
 
 	if (sess->terminated) {
@@ -148,8 +146,13 @@ static void ack_handler(struct sipsess_sock *sock, const struct sip_msg *msg)
 		return;
 	}
 
-	if (awaiting_answer) {
-		sess->awaiting_answer = false;
+	if (sess->neg_state == SDP_NEG_LOCAL_OFFER) {
+		if (!mbuf_get_left(msg->mb)) {
+			sipsess_terminate(sess, EPROTO, NULL);
+			return;
+		}
+
+		sess->neg_state = SDP_NEG_DONE;
 		err = sess->answerh(msg, sess->arg);
 	}
 
@@ -171,13 +174,14 @@ static void ack_handler(struct sipsess_sock *sock, const struct sip_msg *msg)
 
 static void prack_handler(struct sipsess_sock *sock, const struct sip_msg *msg)
 {
+	bool sdp;
 	struct sipsess *sess;
 	struct mbuf *desc = NULL;
-	bool awaiting_answer = false;
+	bool awaiting_prack = false;
 
 	sess = sipsess_find(sock, msg);
 
-	if (!sess || sipsess_reply_ack(sess, msg, &awaiting_answer)) {
+	if (!sess || sipsess_reply_prack(sess, msg, &awaiting_prack)) {
 		(void)sip_reply(sock->sip, msg, 481,
 				"Transaction Does Not Exist");
 		return;
@@ -192,16 +196,27 @@ static void prack_handler(struct sipsess_sock *sock, const struct sip_msg *msg)
 		return;
 	}
 
-	if (sess->prackh)
-		sess->prackh(msg, sess->arg);
+	sdp = mbuf_get_left(msg->mb);
 
-	if (awaiting_answer) {
-		sess->awaiting_answer = false;
+	if (awaiting_prack)
+		--sess->prack_waiting_cnt;
+
+	if (sess->neg_state == SDP_NEG_LOCAL_OFFER) {
+		if (!sdp) {
+			sipsess_terminate(sess, EPROTO, NULL);
+			return;
+		}
+
+		sess->neg_state = SDP_NEG_DONE;
 		(void)sess->answerh(msg, sess->arg);
 	}
-	else if (msg && mbuf_get_left(msg->mb)) {
+	else if (sess->neg_state == SDP_NEG_DONE && sdp) {
+		sess->neg_state = SDP_NEG_REMOTE_OFFER;
 		(void)sess->offerh(&desc, msg, sess->arg);
 	}
+
+	if (sess->prackh)
+		sess->prackh(msg, sess->arg);
 
 	(void)sipsess_reply_2xx(sess, msg, 200, "OK", desc, NULL, NULL);
 
@@ -214,7 +229,7 @@ static void target_refresh_handler(struct sipsess_sock *sock,
 {
 	struct sip *sip = sock->sip;
 	bool is_invite;
-	bool got_offer;
+	bool sdp;
 	struct sipsess *sess;
 	struct mbuf *desc = NULL;
 	char m[256];
@@ -227,19 +242,27 @@ static void target_refresh_handler(struct sipsess_sock *sock,
 	}
 
 	is_invite = !pl_strcmp(&msg->met, "INVITE");
-	got_offer = (mbuf_get_left(msg->mb) > 0);
+	sdp = (mbuf_get_left(msg->mb) > 0);
 
 	if (!sip_dialog_rseq_valid(sess->dlg, msg)) {
 		(void)sip_treply(NULL, sip, msg, 500, "Server Internal Error");
 		return;
 	}
 
-	if ((is_invite && sess->st) || sess->awaiting_answer) {
-		(void)sip_treplyf(NULL, NULL, sip, msg, false,
-				  500, "Server Internal Error",
-				  "Retry-After: 5\r\n"
-				  "Content-Length: 0\r\n"
-				  "\r\n");
+	if ((is_invite && sess->st)
+	    || (sdp && sess->neg_state == SDP_NEG_LOCAL_OFFER)) {
+		if (!sess->established) {
+			uint32_t wait = rand_u16() % 11;
+			(void)sip_treplyf(NULL, NULL, sip, msg, false,
+					  500, "Server Internal Error",
+					  "Retry-After: %u\r\n"
+					  "Content-Length: 0\r\n"
+					  "\r\n", wait);
+		}
+		else {
+			(void)sip_treply(NULL, sip, msg, 491,
+					 "Request Pending");
+		}
 		return;
 	}
 
@@ -248,11 +271,19 @@ static void target_refresh_handler(struct sipsess_sock *sock,
 		return;
 	}
 
-	if (got_offer || is_invite) {
+	if (sdp && !sipsess_refresh_allowed(sess)) {
+		(void)sip_reply(sip, msg, 488, "Not Acceptable Here");
+		return;
+	}
+
+	if (is_invite || sdp) {
+		sess->neg_state = sdp ? SDP_NEG_REMOTE_OFFER :
+				  SDP_NEG_LOCAL_OFFER;
 		err = sess->offerh(&desc, msg, sess->arg);
 		if (err) {
 			(void)sip_reply(sip, msg, 488,
 					str_error(err, m, sizeof(m)));
+			sess->neg_state = SDP_NEG_DONE;
 			return;
 		}
 	}
@@ -376,10 +407,6 @@ int sipsess_listen(struct sipsess_sock **sockp, struct sip *sip,
 		goto out;
 
 	err = hash_alloc(&sock->ht_ack, htsize);
-	if (err)
-		goto out;
-
-	err = hash_alloc(&sock->ht_prack, htsize);
 	if (err)
 		goto out;
 

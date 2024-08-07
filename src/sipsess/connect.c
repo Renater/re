@@ -68,7 +68,9 @@ static int send_handler(enum sip_transp tp, struct sa *src,
 		*contp = cont;
 
 out:
-	sess->sent_offer = desc != NULL;
+	if (desc)
+		sess->neg_state = SDP_NEG_LOCAL_OFFER;
+
 	mem_deref(desc);
 	return err;
 }
@@ -79,6 +81,9 @@ static void invite_resp_handler(int err, const struct sip_msg *msg, void *arg)
 	struct sipsess *sess = arg;
 	struct mbuf *desc = NULL;
 	bool sdp;
+	const struct sip_hdr *contact;
+	struct sip_addr addr;
+	char *uri;
 
 	if (!sess)
 		return;
@@ -86,12 +91,28 @@ static void invite_resp_handler(int err, const struct sip_msg *msg, void *arg)
 	if (!msg || err || sip_request_loops(&sess->ls, msg->scode))
 		goto out;
 
+	if (!sip_dialog_cmp_half(sess->dlg, msg)
+		|| sip_dialog_lseqinv(sess->dlg) != msg->cseq.num)
+		goto out;
+
+	sdp = mbuf_get_left(msg->mb) > 0;
+
 	if (msg->scode < 200) {
 		sess->progrh(msg, sess->arg);
-		sdp = mbuf_get_left(msg->mb) > 0;
 
-		if (sdp && sess->sent_offer) {
-			sess->awaiting_answer = false;
+		if (msg->scode == 100)
+			return;
+
+		contact = sip_msg_hdr(msg, SIP_HDR_CONTACT);
+		if (pl_isset(&msg->to.tag) && contact) {
+			err = sip_dialog_established(sess->dlg) ?
+					sip_dialog_update(sess->dlg, msg) :
+					sip_dialog_create(sess->dlg, msg);
+			if (err)
+				goto out;
+		}
+
+		if (sdp && sess->neg_state == SDP_NEG_LOCAL_OFFER) {
 			err = sess->answerh(msg, sess->arg);
 			if (err)
 				goto out;
@@ -99,45 +120,69 @@ static void invite_resp_handler(int err, const struct sip_msg *msg, void *arg)
 
 		if (sip_msg_hdr_has_value(msg, SIP_HDR_REQUIRE, "100rel")
 				&& sess->rel100_supported) {
-			if (sdp && !sess->sent_offer) {
-				sess->modify_pending = false;
-				err = sess->offerh(&desc, msg, sess->arg);
+
+			if (sess->neg_state == SDP_NEG_NONE && !sdp)
+				goto out;
+
+			if (sdp) {
+				if (sess->neg_state == SDP_NEG_LOCAL_OFFER) {
+					sess->neg_state = SDP_NEG_DONE;
+				}
+				else if (sess->neg_state == SDP_NEG_NONE) {
+					sess->neg_state = SDP_NEG_REMOTE_OFFER;
+					err = sess->offerh(&desc, msg,
+							   sess->arg);
+				}
 			}
 
-			err |= sip_dialog_established(sess->dlg) ?
-					sip_dialog_update(sess->dlg, msg) :
-					sip_dialog_create(sess->dlg, msg);
 			err |= sipsess_prack(sess, msg->cseq.num, msg->rel_seq,
 					     &msg->cseq.met, desc);
-			mem_deref(desc);
-			sess->desc = mem_deref(sess->desc);
 			if (err)
 				goto out;
+
+			if (sess->neg_state == SDP_NEG_REMOTE_OFFER
+			    && mbuf_get_left(desc))
+				sess->neg_state = SDP_NEG_DONE;
+
+			mem_deref(desc);
+			sess->desc = mem_deref(sess->desc);
 		}
 
 		return;
 	}
 	else if (msg->scode < 300) {
 
+		sess->established = true;
+
 		sess->hdrs = mem_deref(sess->hdrs);
 
 		err = sip_dialog_established(sess->dlg) ?
 				sip_dialog_update(sess->dlg, msg) :
 				sip_dialog_create(sess->dlg, msg);
-		if (err)
-			goto out;
 
-		if (sess->sent_offer)
-			err = sess->answerh(msg, sess->arg);
-		else {
-			sess->modify_pending = false;
-			err = sess->offerh(&desc, msg, sess->arg);
+		if (sdp && !err) {
+			if (sess->neg_state == SDP_NEG_LOCAL_OFFER) {
+				sess->neg_state = SDP_NEG_DONE;
+				err = sess->answerh(msg, sess->arg);
+			}
+			else if (sess->neg_state == SDP_NEG_NONE) {
+				sess->neg_state = SDP_NEG_REMOTE_OFFER;
+				err = sess->offerh(&desc, msg, sess->arg);
+			}
 		}
 
 		err |= sipsess_ack(sess->sock, sess->dlg, msg->cseq.num,
-				   sess->auth, sess->ctype, desc);
+				  sess->auth, sess->ctype, desc);
+		if (err)
+			goto out;
 
-		sess->established = true;
+		if (sess->neg_state == SDP_NEG_NONE && !sdp)
+			goto out;
+
+		if (sess->neg_state == SDP_NEG_REMOTE_OFFER
+		    && mbuf_get_left(desc))
+			sess->neg_state = SDP_NEG_DONE;
+
 		mem_deref(desc);
 
 		if (err || sess->terminated)
@@ -153,24 +198,41 @@ static void invite_resp_handler(int err, const struct sip_msg *msg, void *arg)
 	}
 	else if (msg->scode < 400) {
 
-		/* Redirect to first Contact */
-
 		if (sess->terminated)
 			goto out;
 
-		err = sip_dialog_update(sess->dlg, msg);
-		if (err)
-			goto out;
+		if (sess->redirecth) {
 
-		if (sess->redirecth)
-			sess->redirecth(msg, sip_dialog_uri(sess->dlg),
-				        sess->arg);
+			contact = sip_msg_hdr(msg, SIP_HDR_CONTACT);
+			if (!contact) {
+				err = EBADMSG;
+				goto out;
+			}
+			if (sip_addr_decode(&addr, &contact->val)) {
+				err = EBADMSG;
+				goto out;
+			}
+			err = pl_strdup(&uri, &addr.auri);
+			if (err)
+				goto out;
 
-		err = invite(sess);
-		if (err)
-			goto out;
+			sess->redirecth(msg, uri, sess->arg);
 
-		return;
+			mem_deref(uri);
+		}
+		else {
+			/* Redirect to first Contact */
+
+			err = sip_dialog_update(sess->dlg, msg);
+			if (err)
+				goto out;
+
+			err = invite(sess);
+			if (err)
+				goto out;
+
+			return;
+		}
 	}
 	else {
 		if (sess->terminated)
@@ -199,6 +261,7 @@ static void invite_resp_handler(int err, const struct sip_msg *msg, void *arg)
 		sipsess_terminate(sess, err, msg);
 	else
 		mem_deref(sess);
+
 }
 
 

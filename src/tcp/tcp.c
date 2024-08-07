@@ -3,7 +3,6 @@
  *
  * Copyright (C) 2010 Creytiv.com
  */
-
 #include <stdlib.h>
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
@@ -12,10 +11,6 @@
 #include <io.h>
 #endif
 #if !defined(WIN32)
-#define __USE_POSIX 1  /**< Use POSIX flag */
-#define __USE_XOPEN2K 1/**< Use POSIX.1:2001 code */
-#define __USE_MISC 1
-#define _GNU_SOURCE 1
 #include <netdb.h>
 #endif
 #include <string.h>
@@ -54,6 +49,7 @@ enum {
 
 /** Defines a listening TCP socket */
 struct tcp_sock {
+	struct re_fhs *fhs;
 	re_sock_t fd;         /**< Listening file descriptor         */
 	re_sock_t fdc;        /**< Cached connection file descriptor */
 	tcp_conn_h *connh;    /**< TCP Connect handler               */
@@ -66,6 +62,7 @@ struct tcp_sock {
 struct tcp_conn {
 	struct list helpers;  /**< List of TCP-helpers               */
 	struct list sendq;    /**< Sending queue                     */
+	struct re_fhs *fhs;
 	re_sock_t fdc;        /**< Connection file descriptor        */
 	tcp_estab_h *estabh;  /**< Connection established handler    */
 	tcp_send_h *sendh;    /**< Data send handler                 */
@@ -135,11 +132,27 @@ static void sock_destructor(void *data)
 	struct tcp_sock *ts = data;
 
 	if (ts->fd != RE_BAD_SOCK) {
-		fd_close(ts->fd);
+		ts->fhs = fd_close(ts->fhs);
 		(void)close(ts->fd);
 	}
 	if (ts->fdc != RE_BAD_SOCK)
 		(void)close(ts->fdc);
+}
+
+
+static struct tcp_sock *sock_constructor(void)
+{
+	struct tcp_sock *ts;
+
+	ts = mem_zalloc(sizeof(*ts), sock_destructor);
+	if (!ts)
+		return NULL;
+
+	ts->fhs = NULL;
+	ts->fd	= RE_BAD_SOCK;
+	ts->fdc = RE_BAD_SOCK;
+
+	return ts;
 }
 
 
@@ -151,7 +164,7 @@ static void conn_destructor(void *data)
 	list_flush(&tc->sendq);
 
 	if (tc->fdc != RE_BAD_SOCK) {
-		fd_close(tc->fdc);
+		tc->fhs = fd_close(tc->fhs);
 		(void)close(tc->fdc);
 	}
 }
@@ -185,7 +198,7 @@ static int enqueue(struct tcp_conn *tc, struct mbuf *mb)
 
 	if (!tc->sendq.head && !tc->sendh) {
 
-		err = fd_listen(tc->fdc, FD_READ | FD_WRITE,
+		err = fd_listen(&tc->fhs, tc->fdc, FD_READ | FD_WRITE,
 				tcp_recv_handler, tc);
 		if (err)
 			return err;
@@ -258,7 +271,7 @@ static void conn_close(struct tcp_conn *tc, int err)
 
 	/* Stop polling */
 	if (tc->fdc != RE_BAD_SOCK) {
-		fd_close(tc->fdc);
+		tc->fhs = fd_close(tc->fhs);
 		(void)close(tc->fdc);
 		tc->fdc = RE_BAD_SOCK;
 	}
@@ -275,31 +288,34 @@ static void tcp_recv_handler(int flags, void *arg)
 	bool hlp_estab = false;
 	struct le *le;
 	ssize_t n;
-	int err;
+	int err = 0;
 	socklen_t err_len = sizeof(err);
 
 	if (flags & FD_EXCEPT) {
 		DEBUG_INFO("recv handler: got FD_EXCEPT on fd=%d\n", tc->fdc);
 	}
 
-	/* check for any errors */
-	if (-1 == getsockopt(tc->fdc, SOL_SOCKET, SO_ERROR,
-			     BUF_CAST &err, &err_len)) {
-		DEBUG_WARNING("recv handler: getsockopt: (%m)\n",
-			      RE_ERRNO_SOCK);
-		return;
+	/* check for connection errors */
+	if (tc->active && !tc->connected) {
+		if (-1 == getsockopt(tc->fdc, SOL_SOCKET, SO_ERROR,
+				     BUF_CAST &err, &err_len)) {
+			DEBUG_WARNING("recv handler: getsockopt: (%m)\n",
+				      RE_ERRNO_SOCK);
+			return;
+		}
 	}
 
-	if (err) {
-		conn_close(tc, err);
-		return;
-	}
 #if 0
 	if (EINPROGRESS != err && EALREADY != err) {
 		DEBUG_WARNING("recv handler: Socket error (%m)\n", err);
 		return;
 	}
 #endif
+
+	if (err) {
+		conn_close(tc, err);
+		return;
+	}
 
 	if (flags & FD_WRITE) {
 
@@ -325,7 +341,7 @@ static void tcp_recv_handler(int flags, void *arg)
 
 			if (!tc->sendq.head && !tc->sendh) {
 
-				err = fd_listen(tc->fdc, FD_READ,
+				err = fd_listen(&tc->fhs, tc->fdc, FD_READ,
 						tcp_recv_handler, tc);
 				if (err) {
 					conn_close(tc, err);
@@ -341,7 +357,8 @@ static void tcp_recv_handler(int flags, void *arg)
 
 		tc->connected = true;
 
-		err = fd_listen(tc->fdc, FD_READ, tcp_recv_handler, tc);
+		err = fd_listen(&tc->fhs, tc->fdc, FD_READ, tcp_recv_handler,
+				tc);
 		if (err) {
 			DEBUG_WARNING("recv handler: fd_listen(): %m\n", err);
 			conn_close(tc, err);
@@ -460,6 +477,7 @@ static struct tcp_conn *conn_alloc(tcp_estab_h *eh, tcp_recv_h *rh,
 
 	list_init(&tc->helpers);
 
+	tc->fhs	   = NULL;
 	tc->fdc    = RE_BAD_SOCK;
 	tc->rxsz   = TCP_RXSZ_DEFAULT;
 	tc->txqsz_max = TCP_TXQSZ_DEFAULT;
@@ -469,22 +487,6 @@ static struct tcp_conn *conn_alloc(tcp_estab_h *eh, tcp_recv_h *rh,
 	tc->arg    = arg;
 
 	return tc;
-}
-
-
-static void tcp_sockopt_set(re_sock_t fd)
-{
-#ifdef SO_LINGER
-	const struct linger dl = {0, 0};
-	int err;
-
-	err = setsockopt(fd, SOL_SOCKET, SO_LINGER, BUF_CAST &dl, sizeof(dl));
-	if (err) {
-		DEBUG_WARNING("sockopt: SO_LINGER (%m)\n", err);
-	}
-#else
-	(void)fd;
-#endif
 }
 
 
@@ -522,7 +524,6 @@ static void tcp_conn_handler(int flags, void *arg)
 {
 	struct sa peer;
 	struct tcp_sock *ts = arg;
-	int err;
 
 	(void)flags;
 
@@ -531,23 +532,61 @@ static void tcp_conn_handler(int flags, void *arg)
 	if (ts->fdc != RE_BAD_SOCK)
 		(void)close(ts->fdc);
 
+#ifdef HAVE_ACCEPT4
+	ts->fdc = accept4(ts->fd, &peer.u.sa, &peer.len, SOCK_NONBLOCK);
+	if (ts->fdc == RE_BAD_SOCK) {
+		return;
+	}
+#else
 	ts->fdc = accept(ts->fd, &peer.u.sa, &peer.len);
 	if (ts->fdc == RE_BAD_SOCK) {
 		return;
 	}
 
-	err = net_sockopt_blocking_set(ts->fdc, false);
+	int err = net_sockopt_blocking_set(ts->fdc, false);
 	if (err) {
 		DEBUG_WARNING("conn handler: nonblock set: %m\n", err);
 		(void)close(ts->fdc);
 		ts->fdc = RE_BAD_SOCK;
 		return;
 	}
-
-	tcp_sockopt_set(ts->fdc);
+#endif
 
 	if (ts->connh)
 		ts->connh(&peer, ts->arg);
+}
+
+
+/**
+ * Create a TCP Socket with fd
+ *
+ * @param tsp   Pointer to returned TCP Socket
+ * @param fd    File descriptor
+ * @param ch    Incoming connection handler
+ * @param arg   Handler argument
+ *
+ * @return 0 if success, otherwise errorcode
+ */
+int tcp_sock_alloc_fd(struct tcp_sock **tsp, re_sock_t fd, tcp_conn_h *ch,
+		      void *arg)
+{
+	struct tcp_sock *ts = NULL;
+
+	if (!tsp || fd == RE_BAD_SOCK)
+		return EINVAL;
+
+	ts = sock_constructor();
+	if (!ts)
+		return ENOMEM;
+
+	ts->fd	  = fd;
+	ts->fdc   = RE_BAD_SOCK;
+	ts->connh = ch;
+	ts->arg	  = arg;
+
+	*tsp = ts;
+
+	return fd_listen(&ts->fhs, ts->fd, FD_READ, tcp_conn_handler, ts);
 }
 
 
@@ -573,7 +612,7 @@ int tcp_sock_alloc(struct tcp_sock **tsp, const struct sa *local,
 	if (!tsp)
 		return EINVAL;
 
-	ts = mem_zalloc(sizeof(*ts), sock_destructor);
+	ts = sock_constructor();
 	if (!ts)
 		return ENOMEM;
 
@@ -627,8 +666,6 @@ int tcp_sock_alloc(struct tcp_sock **tsp, const struct sa *local,
 			continue;
 		}
 
-		tcp_sockopt_set(fd);
-
 		/* OK */
 		ts->fd = fd;
 		err = 0;
@@ -667,7 +704,7 @@ struct tcp_sock *tcp_sock_dup(struct tcp_sock *tso)
 	if (!tso)
 		return NULL;
 
-	ts = mem_zalloc(sizeof(*ts), sock_destructor);
+	ts = sock_constructor();
 	if (!ts)
 		return NULL;
 
@@ -724,6 +761,9 @@ int tcp_sock_bind(struct tcp_sock *ts, const struct sa *local)
 
 	err = EINVAL;
 	for (r = res; r; r = r->ai_next) {
+		/* use dual socket */
+		if (r->ai_family == AF_INET6)
+			(void)net_sockopt_v6only(ts->fd, false);
 
 		if (bind(ts->fd, r->ai_addr, SIZ_CAST r->ai_addrlen) < 0) {
 			err = RE_ERRNO_SOCK;
@@ -769,7 +809,7 @@ int tcp_sock_listen(struct tcp_sock *ts, int backlog)
 		return err;
 	}
 
-	return fd_listen(ts->fd, FD_READ, tcp_conn_handler, ts);
+	return fd_listen(&ts->fhs, ts->fd, FD_READ, tcp_conn_handler, ts);
 }
 
 
@@ -802,7 +842,7 @@ int tcp_accept(struct tcp_conn **tcp, struct tcp_sock *ts, tcp_estab_h *eh,
 	tc->fdc = ts->fdc;
 	ts->fdc = RE_BAD_SOCK;
 
-	err = fd_listen(tc->fdc, FD_READ | FD_WRITE | FD_EXCEPT,
+	err = fd_listen(&tc->fhs, tc->fdc, FD_READ | FD_WRITE | FD_EXCEPT,
 			tcp_recv_handler, tc);
 	if (err) {
 		DEBUG_WARNING("accept: fd_listen(): %m\n", err);
@@ -900,8 +940,6 @@ int tcp_conn_alloc(struct tcp_conn **tcp,
 			continue;
 		}
 
-		tcp_sockopt_set(tc->fdc);
-
 		err = 0;
 		break;
 	}
@@ -960,6 +998,10 @@ int tcp_conn_bind(struct tcp_conn *tc, const struct sa *local)
 	for (r = res; r; r = r->ai_next) {
 
 		(void)net_sockopt_reuse_set(tc->fdc, true);
+
+		/* use dual socket */
+		if (r->ai_family == AF_INET6)
+			(void)net_sockopt_v6only(tc->fdc, false);
 
 		/* bind to local address */
 		if (bind(tc->fdc, r->ai_addr, SIZ_CAST r->ai_addrlen) < 0) {
@@ -1075,7 +1117,7 @@ int tcp_conn_connect(struct tcp_conn *tc, const struct sa *peer)
 	if (err)
 		return err;
 
-	return fd_listen(tc->fdc, FD_READ | FD_WRITE | FD_EXCEPT,
+	return fd_listen(&tc->fhs, tc->fdc, FD_READ | FD_WRITE | FD_EXCEPT,
 			 tcp_recv_handler, tc);
 }
 
@@ -1200,7 +1242,8 @@ int tcp_set_send(struct tcp_conn *tc, tcp_send_h *sendh)
 	if (tc->sendq.head || !sendh)
 		return 0;
 
-	return fd_listen(tc->fdc, FD_READ | FD_WRITE, tcp_recv_handler, tc);
+	return fd_listen(&tc->fhs, tc->fdc, FD_READ | FD_WRITE,
+			 tcp_recv_handler, tc);
 }
 
 
