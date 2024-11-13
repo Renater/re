@@ -55,6 +55,7 @@ static void info_resp_handler(int err, const struct sip_msg *msg, void *arg)
 			return;
 
 		case 408:
+			break;
 		case 481:
 			sipsess_terminate(req->sess, 0, msg);
 			break;
