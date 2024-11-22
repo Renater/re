@@ -459,9 +459,11 @@ static int media_encode(const struct sdp_media *m, struct mbuf *mb, bool offer)
 		err |= mbuf_printf(mb, "a=rtcp:%u\r\n",
 				   sa_port(&m->laddr_rtcp));
 
-	err |= mbuf_printf(mb, "a=%s\r\n", disabled ?
-		sdp_dir_name(SDP_INACTIVE) :
-		sdp_dir_name(offer ? m->ldir : m->ldir & m->rdir));
+	if (str_str(proto, "BFCP") == NULL ) {
+		err |= mbuf_printf(mb, "a=%s\r\n", disabled ?
+			sdp_dir_name(SDP_INACTIVE) :
+			sdp_dir_name(offer ? m->ldir : m->ldir & m->rdir));
+	}
 
 	for (le = m->lattrl.head; le; le = le->next)
 		err |= mbuf_printf(mb, "%H", sdp_attr_print, le->data);

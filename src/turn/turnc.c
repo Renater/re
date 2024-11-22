@@ -65,6 +65,7 @@ static void destructor(void *arg)
 	mem_deref(turnc->stun);
 	mem_deref(turnc->uh);
 	mem_deref(turnc->sock);
+	mem_deref(turnc->token);
 }
 
 
@@ -164,17 +165,34 @@ static void allocate_resp_handler(int err, uint16_t scode, const char *reason,
 static int allocate_request(struct turnc *t)
 {
 	const uint8_t proto = IPPROTO_UDP;
+	const uint8_t even_port_flag = 0x01;
 
-	return stun_request(&t->ct, t->stun, t->proto, t->sock, &t->srv, 0,
-			    STUN_METHOD_ALLOCATE,
-			    t->realm ? t->md5_hash : NULL, sizeof(t->md5_hash),
-			    false, allocate_resp_handler, t, 6,
-			    STUN_ATTR_LIFETIME, &t->lifetime,
-			    STUN_ATTR_REQ_TRANSPORT, &proto,
-			    STUN_ATTR_USERNAME, t->realm ? t->username : NULL,
-			    STUN_ATTR_REALM, t->realm,
-			    STUN_ATTR_NONCE, t->nonce,
-			    STUN_ATTR_SOFTWARE, stun_software);
+	if (t->token) {
+        return stun_request(&t->ct, t->stun, t->proto, t->sock, &t->srv, 0,
+                    STUN_METHOD_ALLOCATE,
+                    t->realm ? t->md5_hash : NULL, sizeof(t->md5_hash),
+                    false, allocate_resp_handler, t, 7,
+                    STUN_ATTR_LIFETIME, &t->lifetime,
+                    STUN_ATTR_REQ_TRANSPORT, &proto,
+                    STUN_ATTR_USERNAME, t->realm ? t->username : NULL,
+                    STUN_ATTR_REALM, t->realm,
+                    STUN_ATTR_NONCE, t->nonce,
+                    STUN_ATTR_RSV_TOKEN, t->token,
+                    STUN_ATTR_SOFTWARE, stun_software);
+	}
+	else {
+        return stun_request(&t->ct, t->stun, t->proto, t->sock, &t->srv, 0,
+                    STUN_METHOD_ALLOCATE,
+                    t->realm ? t->md5_hash : NULL, sizeof(t->md5_hash),
+                    false, allocate_resp_handler, t, 7,
+                    STUN_ATTR_LIFETIME, &t->lifetime,
+                    STUN_ATTR_REQ_TRANSPORT, &proto,
+                    STUN_ATTR_USERNAME, t->realm ? t->username : NULL,
+                    STUN_ATTR_REALM, t->realm,
+                    STUN_ATTR_NONCE, t->nonce,
+                    STUN_ATTR_EVEN_PORT, &even_port_flag,
+                    STUN_ATTR_SOFTWARE, stun_software);
+	}
 }
 
 
@@ -395,7 +413,7 @@ static bool udp_recv_handler(struct sa *src, struct mbuf *mb, void *arg)
 int turnc_alloc(struct turnc **turncp, const struct stun_conf *conf, int proto,
 		void *sock, int layer, const struct sa *srv,
 		const char *username, const char *password,
-		uint32_t lifetime, turnc_h *th, void *arg)
+		uint32_t lifetime, uint64_t *token, turnc_h *th, void *arg)
 {
 	struct turnc *turnc;
 	int err;
@@ -433,6 +451,11 @@ int turnc_alloc(struct turnc **turncp, const struct stun_conf *conf, int proto,
 	turnc->psrv = *srv;
 	turnc->srv = *srv;
 	turnc->lifetime = lifetime;
+	turnc->token = NULL;
+	if (token) {
+        turnc->token = mem_alloc(sizeof(uint64_t), NULL);
+        memcpy(turnc->token, token, sizeof(uint64_t));
+	}
 	turnc->th = th;
 	turnc->arg = arg;
 
