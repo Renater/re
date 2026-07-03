@@ -4,6 +4,20 @@
  * Copyright (C) 2010 Creytiv.com
  */
 
+/*
+ * Front headroom reserved in front of every outgoing BFCP message. It must be
+ * large enough for the biggest wrapper that a lower layer may prepend without
+ * reallocating the mbuf. The TURN client (re/src/turn/turnc.c) wraps outgoing
+ * packets either in a 4-byte ChannelData header or, when no channel binding
+ * exists for the destination, in a STUN Send indication (up to 48 bytes for
+ * IPv6: STUN header 20 + 2*attr header 8 + XOR-PEER-ADDR 20). Reserving only
+ * the ChannelData size would make the send-indication path silently fail and
+ * leak the raw BFCP packet straight to the peer, bypassing the relay.
+ */
+enum {
+	BFCP_HDR_OFFSET = 48,
+};
+
 struct bfcp_strans {
 	enum bfcp_prim prim;
 	uint32_t confid;

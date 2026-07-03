@@ -50,11 +50,11 @@ int bfcp_reply(struct bfcp_conn *bc, const struct bfcp_msg *req,
 	bc->mb = mem_deref(bc->mb);
 	tmr_cancel(&bc->tmr2);
 
-	bc->mb = mbuf_alloc(64);
+	bc->mb = mbuf_alloc(BFCP_HDR_OFFSET + 64);
 	if (!bc->mb)
 		return ENOMEM;
 
-	bc->mb->pos = bc->mb->end = 4;
+	bc->mb->pos = bc->mb->end = BFCP_HDR_OFFSET;
 	va_start(ap, attrc);
 	err = bfcp_msg_vencode(bc->mb, req->ver, true, prim, req->confid,
 			       req->tid, req->userid, attrc, &ap);
@@ -63,7 +63,7 @@ int bfcp_reply(struct bfcp_conn *bc, const struct bfcp_msg *req,
 	if (err)
 		goto out;
 
-	bc->mb->pos = 4;
+	bc->mb->pos = BFCP_HDR_OFFSET;
 
 	err = bfcp_send(bc, &req->src, bc->mb);
 	if (err)

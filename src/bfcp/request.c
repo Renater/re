@@ -164,20 +164,20 @@ int bfcp_vrequest(struct bfcp_conn *bc, const struct sa *dst, uint8_t ver,
 	ct->resph  = resph ? resph : dummy_resp_handler;
 	ct->arg    = arg;
 
-	ct->mb = mbuf_alloc(128);
+	ct->mb = mbuf_alloc(BFCP_HDR_OFFSET + 128);
 	if (!ct->mb) {
 		err = ENOMEM;
 		goto out;
 	}
 
-	ct->mb->pos = ct->mb->end = 4;
+	ct->mb->pos = ct->mb->end = BFCP_HDR_OFFSET;
 
 	err = bfcp_msg_vencode(ct->mb, ver, false, prim, confid, ct->tid,
 			       userid, attrc, ap);
 	if (err)
 		goto out;
 
-	ct->mb->pos = 4;
+	ct->mb->pos = BFCP_HDR_OFFSET;
 
 	if (!bc->ctransl.head) {
 
