@@ -66,6 +66,9 @@ static void udp_recv_handler(const struct sa *src, struct mbuf *mb, void *arg)
 		goto out;
 
 	if (bc->mb && strans_cmp(&bc->st, msg)) {
+		/* rewind past any transport header (e.g. TURN) prepended
+		 * by a UDP helper on the previous send */
+		bc->mb->pos = BFCP_HDR_OFFSET;
 		(void)bfcp_send(bc, &msg->src, bc->mb);
 		goto out;
 	}
@@ -95,6 +98,7 @@ static void tcp_recv_handler(struct mbuf *mb, void *arg)
 			goto out;
 
 		if (bc->mb && strans_cmp(&bc->st, msg)) {
+			bc->mb->pos = BFCP_HDR_OFFSET;
 			(void)bfcp_send(bc, &msg->src, bc->mb);
 			goto out;
 		}

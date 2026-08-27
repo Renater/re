@@ -30,10 +30,52 @@ struct bfcp_ctrans {
 	uint32_t confid;
 	uint16_t userid;
 	uint16_t tid;
+	enum bfcp_prim prim;
 };
 
 
 static void tmr_handler(void *arg);
+
+
+/* RFC 4582 section 5.1, table of request/response primitives */
+static bool is_response_to(enum bfcp_prim req, enum bfcp_prim resp)
+{
+	if (resp == BFCP_ERROR)
+		return true;
+
+	switch (req) {
+
+	case BFCP_FLOOR_REQUEST:
+	case BFCP_FLOOR_RELEASE:
+	case BFCP_FLOOR_REQUEST_QUERY:
+		return resp == BFCP_FLOOR_REQUEST_STATUS;
+
+	case BFCP_USER_QUERY:
+		return resp == BFCP_USER_STATUS;
+
+	case BFCP_FLOOR_QUERY:
+		return resp == BFCP_FLOOR_STATUS;
+
+	case BFCP_CHAIR_ACTION:
+		return resp == BFCP_CHAIR_ACTION_ACK;
+
+	case BFCP_HELLO:
+		return resp == BFCP_HELLO_ACK;
+
+	case BFCP_GOODBYE:
+		return resp == BFCP_GOODBYE_ACK;
+
+	/* Server-initiated requests acknowledged by the client */
+	case BFCP_FLOOR_REQUEST_STATUS:
+		return resp == BFCP_FLOOR_REQ_STATUS_ACK;
+
+	case BFCP_FLOOR_STATUS:
+		return resp == BFCP_FLOOR_STATUS_ACK;
+
+	default:
+		return false;
+	}
+}
 
 
 static void dummy_resp_handler(int err, const struct bfcp_msg *msg, void *arg)
@@ -62,6 +104,8 @@ static void dispatch(struct bfcp_conn *bc)
 		int err;
 
 		le = le->next;
+
+		ct->mb->pos = BFCP_HDR_OFFSET;
 
 		err = bfcp_send(bc, &ct->dst, ct->mb);
 		if (err) {
@@ -95,6 +139,12 @@ static void tmr_handler(void *arg)
 		goto out;
 	}
 
+	/* A UDP helper (e.g. TURN) may have prepended its own header
+	 * and moved the position backwards on the previous send; rewind
+	 * to the BFCP message before re-sending, otherwise every
+	 * retransmission gets wrapped one more time. */
+	ct->mb->pos = BFCP_HDR_OFFSET;
+
 	err = bfcp_send(bc, &ct->dst, ct->mb);
 	if (err)
 		goto out;
@@ -121,6 +171,15 @@ bool bfcp_handle_response(struct bfcp_conn *bc, const struct bfcp_msg *msg)
 		return false;
 
 	if (msg->tid != ct->tid)
+		return false;
+
+	/* A request from the peer may carry the same Transaction ID as
+	 * our pending request (server-initiated FloorStatus, or a Hello
+	 * from a peer numbering its own transactions from 1). Responses
+	 * carry the R flag (RFC 4582 section 5.1), but some endpoints
+	 * (Huawei TE30) leave it clear, so also accept a message whose
+	 * primitive is a legal response to the pending request. */
+	if (!msg->r && !is_response_to(ct->prim, msg->prim))
 		return false;
 
 	if (msg->confid != ct->confid)
@@ -161,6 +220,7 @@ int bfcp_vrequest(struct bfcp_conn *bc, const struct sa *dst, uint8_t ver,
 	ct->confid = confid;
 	ct->userid = userid;
 	ct->tid    = bc->tid++;
+	ct->prim   = prim;
 	ct->resph  = resph ? resph : dummy_resp_handler;
 	ct->arg    = arg;
 
